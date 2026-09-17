@@ -23,7 +23,7 @@ the PAC configuration profile and the macOS PKG app-add wizard:
 | --- | --- | --- |
 | `litellm-relay-<version>.pkg` | Prebuilt binary + per-user install | Built by `scripts/build-macos-pkg.sh`, attached to the GitHub Release |
 | PAC configuration profile | Points macOS Auto Proxy at `http://127.0.0.1:4142/proxy.pac` | [`mdm/litellm-relay-pac.mobileconfig.example`](../mdm/litellm-relay-pac.mobileconfig.example) |
-| Managed `config.yaml` | Gateway URL, capture/shadow settings | [`mdm/config.yaml.example`](../mdm/config.yaml.example) |
+| Managed `config.yaml` | Gateway URL, IdP issuer and client id, capture/shadow settings | [`mdm/config.yaml.example`](../mdm/config.yaml.example) |
 
 The managed config can be baked into the `.pkg` at build time
 (`--config-file`) so no separate config delivery is needed:
