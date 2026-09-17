@@ -38,7 +38,7 @@ relay onboard \
   --model claude-sonnet-4-5
 ```
 
-`relay claude-token` is what Claude Code's `apiKeyHelper` calls. It returns a cached identity token, or starts a browser sign-in when the token is missing or within a minute of expiry, and prints only the token to stdout. Diagnostics go to stderr.
+`relay claude-token` is what Claude Code's `apiKeyHelper` calls. It prints a Gateway credential for the configured team to stdout and nothing else; diagnostics go to stderr. Behind it, Relay starts a browser sign-in when the identity token is missing or within a minute of expiry, registers once with the Gateway's authorization server (`/.well-known/litellm-cli-auth`, then `/register`), exchanges the identity token for a Gateway credential at `/token` (the RFC 8693 token-exchange grant, with the team in the `x-litellm-team-id` header), and renews that credential with its refresh token ten minutes before it expires, without a new sign-in. When the refresh token has lapsed, Relay exchanges the identity token again, and when a renewal fails (the Gateway cannot be reached, or no sign-in is possible) it keeps serving the cached credential until that expires. The identity token and the refresh token are only ever posted to the Gateway URL Relay was onboarded with, whatever host the discovery document advertises, and those posts never follow a redirect. Concurrent hook runs take turns on a lock file, so the single-use refresh token is spent once. A Gateway that has no authorization server gets the identity token itself, as before, with a notice on stderr.
 
 ## Generated settings
 
@@ -53,11 +53,11 @@ relay onboard \
 }
 ```
 
-No provider API key is written to the device. The identity token is cached under `~/.litellm-relay/claude-token.json` with `0600` permissions on Unix.
+No provider API key is written to the device. The identity token is cached under `~/.litellm-relay/identity-token.json` and the Gateway credential (one per Gateway and team, with its refresh token) under `~/.litellm-relay/gateway-credentials.json`, both with `0600` permissions on Unix.
 
 ## Gateway configuration
 
-The headline auth mode is JWT with `auto_register`. The Gateway validates the bearer token against your IdP's JWKS and maps claims to a per-user virtual key and team:
+The headline auth mode is JWT with `auto_register`. The Gateway validates the identity token Relay presents at `/token` against your IdP's JWKS, maps its claims to a per-user virtual key and team, and issues the Gateway credential the tools then send as their bearer. The same configuration validates the identity token sent directly by an older Relay:
 
 ```yaml
 general_settings:
@@ -83,4 +83,4 @@ In production, `--authorize-url` points at your corporate IdP's OIDC authorize e
 
 ## MDM rollout
 
-The MDM package installs Claude Code from your internal registry and runs `relay onboard` with your Gateway URL, IdP authorize URL, and default team. Everything else follows the standard Relay rollout in [mdm.md](mdm.md): package the repo, deploy to the pilot scope, then broaden through Jamf or Intune. Because the settings file contains no provider key and the token is fetched at runtime through the IdP, the same package is safe to push fleet-wide.
+The MDM package installs Claude Code from your internal registry and runs `relay onboard` with your Gateway URL, IdP authorize URL, and default team. Everything else follows the standard Relay rollout in [mdm.md](mdm.md): package the repo, deploy to the pilot scope, then broaden through Jamf or Intune. Because the settings file contains no provider key and the credential is obtained at runtime from the developer's IdP sign-in, the same package is safe to push fleet-wide.

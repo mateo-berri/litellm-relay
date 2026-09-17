@@ -121,5 +121,9 @@ a corporate proxy need a coordinated PAC file rather than a second competing
 profile.
 
 Using `--api-key` (or `gateway.api_key` in the managed config) writes a static
-Gateway key to every device. Prefer per-user browser SSO where your Gateway
-supports it.
+Gateway key to every device. With an IdP onboarded, Relay exchanges each
+developer's sign-in for their own Gateway credential instead, so the flag is
+only needed for Gateways without the authorization server. A push has no
+terminal, so it never opens a browser: it uses the identity the developer
+already signed in with, and keeps a saved Gateway key when there is none. Prefer per-user
+browser SSO where your Gateway supports it.

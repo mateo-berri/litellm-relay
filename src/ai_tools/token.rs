@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ai_tools::idp::{sign_in, token_expiry},
     config::relay_home,
+    system::write_private,
 };
 
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
@@ -22,7 +23,7 @@ struct CachedToken {
 /// token until it nears expiry, then runs a browser sign-in against
 /// `authorize_url`. The token is identity-scoped, so it is shared across tools.
 pub fn ensure_token(authorize_url: &str) -> Result<String> {
-    if let Some(token) = valid_cached_token()? {
+    if let Some(token) = cached_token()? {
         return Ok(token);
     }
     if authorize_url.trim().is_empty() {
@@ -33,7 +34,8 @@ pub fn ensure_token(authorize_url: &str) -> Result<String> {
     Ok(token)
 }
 
-fn valid_cached_token() -> Result<Option<String>> {
+/// The cached IdP token when it is still usable, without any sign-in.
+pub fn cached_token() -> Result<Option<String>> {
     let path = token_cache_path();
     if !path.exists() {
         return Ok(None);
@@ -56,33 +58,15 @@ fn fresh_token(cached: CachedToken, now: i64) -> Option<String> {
 
 fn cache_token(token: &str) -> Result<()> {
     let path = token_cache_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     let cached = CachedToken {
         token: token.to_string(),
         exp: token_expiry(token),
     };
-    fs::write(&path, serde_json::to_string(&cached)?)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    secure_file(&path)?;
-    Ok(())
+    write_private(&path, &serde_json::to_string(&cached)?)
 }
 
 fn token_cache_path() -> PathBuf {
     relay_home().join("identity-token.json")
-}
-
-fn secure_file(path: &PathBuf) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to secure {}", path.display()))?;
-    }
-    let _ = path;
-    Ok(())
 }
 
 #[cfg(test)]

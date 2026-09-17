@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -219,6 +221,7 @@ async fn run_command(command: CommandKind) -> Result<()> {
             oidc_issuer,
             oidc_scopes,
             oidc_redirect_port,
+            allow_sign_in: std::io::stderr().is_terminal(),
             quiet: false,
         }),
         CommandKind::ClaudeToken => print_token(),

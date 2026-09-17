@@ -193,6 +193,7 @@ fn configure_tool(tool: AiTool, params: &AutoConfigureParams) -> Result<()> {
             oidc_issuer: params.oidc_issuer.clone(),
             oidc_scopes: params.oidc_scopes.clone(),
             oidc_redirect_port: params.oidc_redirect_port,
+            allow_sign_in: false,
             quiet: true,
         }),
     }

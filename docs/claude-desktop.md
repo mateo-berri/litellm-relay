@@ -15,9 +15,19 @@ sudo relay onboard-claude-desktop \
   --oidc-issuer https://login.yourco.com/v2.0
 ```
 
+## Relay-issued credential
+
+When Relay is onboarded against an IdP (`relay onboard --authorize-url ...`), no credential flag is needed. Relay exchanges the developer's IdP sign-in for a Gateway credential at the Gateway's `/token` endpoint and writes it as the key Claude Desktop sends, so the Gateway attributes the app's traffic to the developer and their team without an admin-issued key.
+
+```bash
+sudo relay onboard-claude-desktop --gateway-url https://gateway.yourco.com
+```
+
+Run from a terminal, the command opens the browser sign-in when no identity token is cached. Without a terminal (an MDM push, the auto-configure daemon) it never opens a browser: it reuses the identity the developer already signed in with, so sign in once (`relay claude-token`, `relay codex-token`, or the command above) before its first run. The daemon renews the credential with its refresh token and rewrites the managed file on every run (hourly by default), so the key in the file always has close to its full lifetime left. Claude Desktop reads the file on launch, so an app left running for longer than the credential's lifetime (24 hours by default) needs a restart to pick up the renewed one. When the exchange fails and a Gateway key is already saved in Relay's config, Relay keeps that key and reports the failure on stderr.
+
 ## Static key (proof of concept)
 
-Distribute a shared Gateway key instead of SSO.
+Distribute a shared Gateway key instead of a per-developer sign-in. An explicit `--api-key` wins over the Relay-issued credential.
 
 ```bash
 sudo relay onboard-claude-desktop \
