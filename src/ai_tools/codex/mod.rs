@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::{
-    ai_tools::token::ensure_token,
+    ai_tools::{idp::SIGN_IN_CEILING, token::ensure_token},
     config::{load_settings, save_settings, IdpOverrides, RelaySettings},
     system::home_dir,
 };
@@ -17,6 +17,11 @@ const WIRE_API: &str = "responses";
 /// How often Codex proactively refreshes the bearer token, matching its own
 /// default of five minutes so the short-lived identity token stays valid.
 const TOKEN_REFRESH_INTERVAL_MS: i64 = 300_000;
+
+/// How long Codex waits for the token helper before killing it. Its default is
+/// five seconds, shorter than any browser sign-in, so the helper is given the
+/// whole sign-in ceiling.
+const TOKEN_COMMAND_TIMEOUT_MS: i64 = SIGN_IN_CEILING.as_millis() as i64;
 
 /// Environment variable that overrides where the Codex config is written. Used
 /// by tests so they never touch the developer's real `~/.codex/config.toml`.
@@ -228,6 +233,7 @@ fn build_provider_table(settings: &RelaySettings, credential: &Credential, exe: 
             let mut args = Array::new();
             args.push("codex-token");
             auth["args"] = value(args);
+            auth["timeout_ms"] = value(TOKEN_COMMAND_TIMEOUT_MS);
             auth["refresh_interval_ms"] = value(TOKEN_REFRESH_INTERVAL_MS);
             provider["auth"] = Item::Table(auth);
         }
@@ -317,6 +323,11 @@ mod tests {
         );
         assert_eq!(provider["auth"]["args"][0].as_str(), Some("codex-token"));
         assert!(provider["auth"]["refresh_interval_ms"].is_integer());
+        assert_eq!(
+            provider["auth"]["timeout_ms"].as_integer(),
+            Some(SIGN_IN_CEILING.as_millis() as i64),
+            "Codex must wait out a whole browser sign-in before killing the helper"
+        );
         assert!(
             provider.get("experimental_bearer_token").is_none(),
             "SSO path must not embed a static provider key"

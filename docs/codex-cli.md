@@ -52,10 +52,11 @@ http_headers = { x-litellm-team = "engineering" }
 [model_providers.litellm.auth]
 command = "/usr/local/bin/litellm-relay"
 args = ["codex-token"]
+timeout_ms = 390000
 refresh_interval_ms = 300000
 ```
 
-There is no API key in the file. `relay codex-token` prints a valid IdP bearer token on stdout, which is exactly what Codex's `auth` hook expects. The file is written with `0600` permissions.
+There is no API key in the file. `relay codex-token` prints a valid IdP bearer token on stdout, which is exactly what Codex's `auth` hook expects. `timeout_ms` raises Codex's five-second ceiling on the helper to the length of a whole browser sign-in, so the first `codex` run can complete the IdP flow instead of being killed mid sign-in. The file is written with `0600` permissions.
 
 ## Step 3: Start Codex and sign in
 

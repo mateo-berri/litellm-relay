@@ -18,6 +18,10 @@ use crate::config::IdpSection;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest a first sign-in can legitimately take: a failed refresh, discovery, the browser
+/// round trip, and the code exchange. Tool hooks that kill a slow token command wait this long.
+pub const SIGN_IN_CEILING: Duration =
+    Duration::from_secs(HTTP_TIMEOUT.as_secs() * 3 + CALLBACK_TIMEOUT.as_secs());
 const CALLBACK_PATH: &str = "/callback";
 const DEFAULT_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
 const FOREIGN_CALLBACK_MESSAGE: &str =
