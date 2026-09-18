@@ -15,7 +15,7 @@ use crate::{
         codex::{onboard as onboard_codex, CodexOnboardParams},
         detect::{detect_all, AiTool, DetectContext, Detection},
     },
-    config::load_settings,
+    config::{load_settings, IdpOverrides, RelaySettings},
 };
 
 /// Overrides forwarded to each tool's onboarder. Every field is optional; when
@@ -25,7 +25,6 @@ use crate::{
 #[derive(Debug, Default, Clone)]
 pub struct AutoConfigureParams {
     pub gateway_url: Option<String>,
-    pub authorize_url: Option<String>,
     pub team: Option<String>,
     /// Static Gateway key for tools without an IdP (Claude Desktop static mode,
     /// Codex static key).
@@ -33,10 +32,7 @@ pub struct AutoConfigureParams {
     /// Codex-only: read the bearer key from this env var instead of the token
     /// helper hook.
     pub env_key: Option<String>,
-    pub oidc_client_id: Option<String>,
-    pub oidc_issuer: Option<String>,
-    pub oidc_scopes: Option<String>,
-    pub oidc_redirect_port: Option<u16>,
+    pub idp: IdpOverrides,
 }
 
 /// Detect installed tools and onboard each one, continuing past any single
@@ -56,22 +52,30 @@ pub fn autoconfigure(mut params: AutoConfigureParams, only: &[AiTool]) -> Result
     )
 }
 
-/// When the caller supplies no explicit credential and no IdP authorize URL is
-/// configured, reuse the saved Gateway key so tools that accept a static
-/// credential (Codex, Claude Desktop) still get wired up on non-SSO setups. A
-/// configured IdP is always preferred and left untouched.
+/// When the caller supplies no explicit credential and the IdP that results
+/// from the saved config plus the overrides is incomplete, reuse the saved
+/// Gateway key so tools that accept a static credential (Codex, Claude
+/// Desktop) still get wired up on non-SSO setups. A configured IdP is always
+/// preferred and left untouched.
 fn apply_credential_fallback(params: &mut AutoConfigureParams) -> Result<()> {
-    if params.api_key.is_some() || params.env_key.is_some() || params.authorize_url.is_some() {
+    if params.api_key.is_some() || params.env_key.is_some() {
         return Ok(());
     }
-    let settings = load_settings()?;
-    if settings.idp.authorize_url.trim().is_empty() {
-        params.api_key = settings
-            .gateway
-            .api_key
-            .filter(|key| !key.trim().is_empty());
-    }
+    params.api_key = saved_key_fallback(&params.idp, &load_settings()?);
     Ok(())
+}
+
+fn saved_key_fallback(overrides: &IdpOverrides, settings: &RelaySettings) -> Option<String> {
+    let mut idp = settings.idp.clone();
+    idp.apply(overrides);
+    if idp.is_configured() {
+        return None;
+    }
+    settings
+        .gateway
+        .api_key
+        .clone()
+        .filter(|key| !key.trim().is_empty())
 }
 
 /// Result of attempting to configure one detected tool.
@@ -170,29 +174,29 @@ fn configure_tool(tool: AiTool, params: &AutoConfigureParams) -> Result<()> {
     match tool {
         AiTool::ClaudeCode => onboard(OnboardParams {
             gateway_url: params.gateway_url.clone(),
-            authorize_url: params.authorize_url.clone(),
             team: params.team.clone(),
             model: None,
             api_key: params.api_key.clone(),
+            idp: params.idp.clone(),
             quiet: true,
         }),
         AiTool::Codex => onboard_codex(CodexOnboardParams {
             gateway_url: params.gateway_url.clone(),
-            authorize_url: params.authorize_url.clone(),
             team: params.team.clone(),
             model: None,
             env_key: params.env_key.clone(),
             api_key: params.api_key.clone(),
+            idp: params.idp.clone(),
             quiet: true,
         }),
         AiTool::ClaudeDesktop => onboard_desktop(OnboardDesktopParams {
             gateway_url: params.gateway_url.clone(),
             api_key: params.api_key.clone(),
             model: None,
-            oidc_client_id: params.oidc_client_id.clone(),
-            oidc_issuer: params.oidc_issuer.clone(),
-            oidc_scopes: params.oidc_scopes.clone(),
-            oidc_redirect_port: params.oidc_redirect_port,
+            oidc_client_id: params.idp.client_id.clone(),
+            oidc_issuer: params.idp.issuer.clone(),
+            oidc_scopes: params.idp.scopes.clone(),
+            oidc_redirect_port: params.idp.redirect_port,
             quiet: true,
         }),
     }
@@ -318,5 +322,64 @@ mod tests {
         );
         assert!(result.is_ok());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    fn settings(issuer: &str, client_id: &str, api_key: Option<&str>) -> RelaySettings {
+        let mut settings = RelaySettings::default();
+        settings.idp.issuer = issuer.into();
+        settings.idp.client_id = client_id.into();
+        settings.gateway.api_key = api_key.map(str::to_string);
+        settings
+    }
+
+    #[test]
+    fn should_fall_back_to_the_saved_key_only_without_a_usable_idp() {
+        let saved_key = Some("sk-saved");
+        let no_overrides = IdpOverrides::default();
+
+        assert_eq!(
+            saved_key_fallback(&no_overrides, &settings("", "", saved_key)),
+            Some("sk-saved".into())
+        );
+        assert_eq!(
+            saved_key_fallback(&no_overrides, &settings("", "", Some("  "))),
+            None
+        );
+        assert_eq!(
+            saved_key_fallback(
+                &no_overrides,
+                &settings("https://login.example.com", "client", saved_key)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn should_judge_the_idp_after_applying_the_overrides() {
+        let saved_key = Some("sk-saved");
+        let issuer_only = IdpOverrides {
+            issuer: Some("https://login.example.com".into()),
+            ..IdpOverrides::default()
+        };
+        let client_only = IdpOverrides {
+            client_id: Some("client".into()),
+            ..IdpOverrides::default()
+        };
+
+        assert_eq!(
+            saved_key_fallback(&issuer_only, &settings("", "", saved_key)),
+            Some("sk-saved".into())
+        );
+        assert_eq!(
+            saved_key_fallback(&issuer_only, &settings("", "client", saved_key)),
+            None
+        );
+        assert_eq!(
+            saved_key_fallback(
+                &client_only,
+                &settings("https://login.example.com", "", saved_key)
+            ),
+            None
+        );
     }
 }
