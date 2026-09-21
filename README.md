@@ -58,16 +58,21 @@ Pass `--skip-autoconfigure` to `install.sh` to disable it.
 
 Before it writes a static Gateway key into any tool, `autoconfigure` verifies
 that key against the Gateway with `GET /v1/models`. If the Gateway rejects it
-(for example the session credential from `relay setup` has expired) or cannot
-be reached, the run leaves every tool config untouched, prints
+with 401 (for example the session credential from `relay setup` has expired) or
+cannot be reached, the run leaves every tool config untouched, prints
 `Run litellm-relay setup to sign in again`, and exits non-zero, so the scheduled
-job fails visibly instead of rewriting a dead key every hour. When the Gateway
-reported an expiry at sign-in, the run also warns once the credential is within
-24 hours of it. The same check is exposed on `/api/status` as a `credential`
-block (`state` is `valid`, `rejected`, `unverifiable`, or `missing`; `expiry` is
+job fails visibly instead of rewriting a dead key every hour. A key the Gateway
+authenticates but answers 403 for (its `allowed_routes` or `key_type` leaves out
+`/v1/models`) is still written, with a warning that quotes the Gateway. The
+check only runs once a supported tool is detected. When the Gateway reported an
+expiry at sign-in, the run also warns once the credential is within 24 hours of
+it. The same check is exposed on `/api/status` as a `credential` block (`state`
+is `valid`, `restricted`, `rejected`, `unverifiable`, or `missing`; `expiry` is
 `unknown`, `ok`, `expiring_soon`, or `expired`; plus `detail`, `checked_at`,
 `enrolled_at`, and `expires_at`), and the dashboard shows it as the
-`Gateway credential` row
+`Gateway credential` row. The status endpoint serves the last check for up to
+60 seconds and refreshes it in the background, so only the first call after
+`serve` starts waits on the Gateway (at most 10 seconds)
 
 ## Developers see their own usage, locally
 

@@ -4,7 +4,7 @@
 //! through the Gateway automatically, rather than requiring the operator to run
 //! a separate onboard command per tool per machine.
 
-use std::time::Duration;
+use std::future::Future;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -19,10 +19,10 @@ use crate::{
         detect::{detect_all, AiTool, DetectContext, Detection},
     },
     config::load_settings,
-    credential::{check_credential, expiry_state, CredentialCheck, ExpiryState, REENROLL_HINT},
+    credential::{
+        check_client, check_credential, expiry_state, CredentialCheck, ExpiryState, REENROLL_HINT,
+    },
 };
-
-const CREDENTIAL_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Overrides forwarded to each tool's onboarder. Every field is optional; when
 /// unset the individual onboarders fall back to the saved Relay config, so a
@@ -50,6 +50,7 @@ pub struct AutoConfigureParams {
 pub enum CredentialGate {
     NotStatic,
     Verified { expiry: ExpiryState },
+    Restricted { detail: String },
     Rejected { detail: String },
     Unverifiable { gateway: String, detail: String },
 }
@@ -64,7 +65,7 @@ pub enum CredentialGate {
 /// file lives under `/etc`) while the per-user agent handles the rest.
 pub async fn autoconfigure(mut params: AutoConfigureParams, only: &[AiTool]) -> Result<()> {
     apply_credential_fallback(&mut params)?;
-    let gate = credential_gate(&params).await?;
+    let gate = credential_gate(params.clone());
     autoconfigure_with(
         &DetectContext::from_env(),
         params,
@@ -72,6 +73,7 @@ pub async fn autoconfigure(mut params: AutoConfigureParams, only: &[AiTool]) -> 
         gate,
         &mut configure_tool,
     )
+    .await
 }
 
 /// When the caller supplies no explicit credential and no IdP authorize URL is
@@ -93,7 +95,7 @@ fn apply_credential_fallback(params: &mut AutoConfigureParams) -> Result<()> {
 }
 
 /// Verify the static key against the Gateway before it lands in any tool config.
-async fn credential_gate(params: &AutoConfigureParams) -> Result<CredentialGate> {
+async fn credential_gate(params: AutoConfigureParams) -> Result<CredentialGate> {
     let Some(api_key) = &params.api_key else {
         return Ok(CredentialGate::NotStatic);
     };
@@ -105,11 +107,7 @@ async fn credential_gate(params: &AutoConfigureParams) -> Result<CredentialGate>
         .gateway_url
         .clone()
         .unwrap_or_else(|| settings.gateway.url.clone());
-    let http = reqwest::Client::builder()
-        .timeout(CREDENTIAL_CHECK_TIMEOUT)
-        .build()
-        .expect("reqwest client configuration should be valid");
-    let gate = match check_credential(&http, &gateway_url, api_key).await {
+    let gate = match check_credential(&check_client(), &gateway_url, api_key).await {
         CredentialCheck::Valid => {
             let expires_at = settings
                 .gateway
@@ -119,7 +117,8 @@ async fn credential_gate(params: &AutoConfigureParams) -> Result<CredentialGate>
                 expiry: expiry_state(expires_at, Utc::now()),
             }
         }
-        CredentialCheck::Rejected { detail, .. } => CredentialGate::Rejected { detail },
+        CredentialCheck::Restricted { detail } => CredentialGate::Restricted { detail },
+        CredentialCheck::Rejected { detail } => CredentialGate::Rejected { detail },
         CredentialCheck::Unverifiable { detail } => CredentialGate::Unverifiable {
             gateway: gateway_url,
             detail,
@@ -136,12 +135,14 @@ struct Configured {
 
 /// Testable core: detection context, credential gate, and per-tool configure
 /// function are injected so unit tests can assert selection/reporting without
-/// writing real tool config files or talking to a Gateway.
-fn autoconfigure_with(
+/// writing real tool config files or talking to a Gateway. The gate is only
+/// awaited once a tool is detected, so a device with nothing to configure
+/// never talks to the Gateway.
+async fn autoconfigure_with(
     ctx: &DetectContext,
     params: AutoConfigureParams,
     only: &[AiTool],
-    gate: CredentialGate,
+    gate: impl Future<Output = Result<CredentialGate>>,
     configure: &mut dyn FnMut(AiTool, &AutoConfigureParams) -> Result<()>,
 ) -> Result<()> {
     let mut detected = detect_all(ctx);
@@ -163,7 +164,14 @@ fn autoconfigure_with(
     );
     println!();
 
-    match gate {
+    match gate.await? {
+        CredentialGate::Restricted { detail } => {
+            println!(
+                "  {}  The Gateway accepts the stored credential but does not allow it on \
+                 GET /v1/models: {detail}",
+                style("!").yellow().bold()
+            );
+        }
         CredentialGate::Rejected { detail } => {
             println!(
                 "  {}  The Gateway rejected the stored credential: {detail}",
@@ -288,6 +296,7 @@ mod tests {
     use anyhow::anyhow;
     use chrono::DateTime;
     use std::{
+        cell::Cell,
         env, fs,
         path::{Path, PathBuf},
     };
@@ -314,8 +323,64 @@ mod tests {
         }
     }
 
-    #[test]
-    fn should_configure_only_detected_tools() {
+    async fn gate(gate: CredentialGate) -> Result<CredentialGate> {
+        Ok(gate)
+    }
+
+    #[tokio::test]
+    async fn should_not_consult_the_gateway_when_no_tool_is_detected() {
+        let home = temp_home("no-probe");
+        let probed = Cell::new(false);
+        let gate = async {
+            probed.set(true);
+            Ok(CredentialGate::Rejected {
+                detail: "must never be asked".into(),
+            })
+        };
+
+        let result =
+            autoconfigure_with(&ctx(&home), static_key_params(), &[], gate, &mut |_, _| {
+                Ok(())
+            })
+            .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            !probed.get(),
+            "the credential gate ran with nothing to configure"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn should_configure_tools_with_a_route_restricted_credential() {
+        let home = temp_home("restricted");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+
+        let mut seen: Vec<AiTool> = Vec::new();
+        autoconfigure_with(
+            &ctx(&home),
+            static_key_params(),
+            &[],
+            gate(CredentialGate::Restricted {
+                detail: "Virtual key is not allowed to call this route".into(),
+            }),
+            &mut |tool, params| {
+                assert_eq!(params.api_key.as_deref(), Some("sk-static"));
+                seen.push(tool);
+                Ok(())
+            },
+        )
+        .await
+        .expect("a route-restricted key is still a live key");
+
+        assert_eq!(seen, vec![AiTool::ClaudeCode, AiTool::Codex]);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn should_configure_only_detected_tools() {
         let home = temp_home("selected");
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::create_dir_all(home.join(".codex")).unwrap();
@@ -325,20 +390,21 @@ mod tests {
             &ctx(&home),
             AutoConfigureParams::default(),
             &[],
-            CredentialGate::NotStatic,
+            gate(CredentialGate::NotStatic),
             &mut |tool, _| {
                 seen.push(tool);
                 Ok(())
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(seen, vec![AiTool::ClaudeCode, AiTool::Codex]);
         let _ = fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn should_configure_only_the_requested_tools() {
+    #[tokio::test]
+    async fn should_configure_only_the_requested_tools() {
         let home = temp_home("only");
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::create_dir_all(home.join(".codex")).unwrap();
@@ -348,20 +414,21 @@ mod tests {
             &ctx(&home),
             AutoConfigureParams::default(),
             &[AiTool::Codex],
-            CredentialGate::NotStatic,
+            gate(CredentialGate::NotStatic),
             &mut |tool, _| {
                 seen.push(tool);
                 Ok(())
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(seen, vec![AiTool::Codex]);
         let _ = fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn should_continue_when_one_tool_fails() {
+    #[tokio::test]
+    async fn should_continue_when_one_tool_fails() {
         let home = temp_home("partial");
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::create_dir_all(home.join(".codex")).unwrap();
@@ -371,7 +438,7 @@ mod tests {
             &ctx(&home),
             AutoConfigureParams::default(),
             &[],
-            CredentialGate::NotStatic,
+            gate(CredentialGate::NotStatic),
             &mut |tool, _| {
                 attempted += 1;
                 match tool {
@@ -379,15 +446,16 @@ mod tests {
                     _ => Ok(()),
                 }
             },
-        );
+        )
+        .await;
 
         assert!(result.is_ok(), "one failure must not abort the run");
         assert_eq!(attempted, 2);
         let _ = fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn should_error_when_all_tools_fail() {
+    #[tokio::test]
+    async fn should_error_when_all_tools_fail() {
         let home = temp_home("allfail");
         fs::create_dir_all(home.join(".codex")).unwrap();
 
@@ -395,30 +463,32 @@ mod tests {
             &ctx(&home),
             AutoConfigureParams::default(),
             &[],
-            CredentialGate::NotStatic,
+            gate(CredentialGate::NotStatic),
             &mut |_, _| Err(anyhow!("boom")),
-        );
+        )
+        .await;
 
         assert!(result.is_err());
         let _ = fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn should_succeed_with_no_tools_detected() {
+    #[tokio::test]
+    async fn should_succeed_with_no_tools_detected() {
         let home = temp_home("none");
         let result = autoconfigure_with(
             &ctx(&home),
             AutoConfigureParams::default(),
             &[],
-            CredentialGate::NotStatic,
+            gate(CredentialGate::NotStatic),
             &mut |_, _| Ok(()),
-        );
+        )
+        .await;
         assert!(result.is_ok());
         let _ = fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn should_refuse_to_configure_any_tool_with_a_rejected_credential() {
+    #[tokio::test]
+    async fn should_refuse_to_configure_any_tool_with_a_rejected_credential() {
         let home = temp_home("rejected");
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::create_dir_all(home.join(".codex")).unwrap();
@@ -428,14 +498,15 @@ mod tests {
             &ctx(&home),
             static_key_params(),
             &[],
-            CredentialGate::Rejected {
+            gate(CredentialGate::Rejected {
                 detail: "Authentication Error - Expired Key".into(),
-            },
+            }),
             &mut |_, _| {
                 attempted += 1;
                 Ok(())
             },
-        );
+        )
+        .await;
 
         let error = result.expect_err("a rejected credential must fail the run");
         assert!(error.to_string().contains("rejected"), "{error}");
@@ -443,8 +514,8 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn should_leave_tools_untouched_when_the_credential_cannot_be_verified() {
+    #[tokio::test]
+    async fn should_leave_tools_untouched_when_the_credential_cannot_be_verified() {
         let home = temp_home("unverifiable");
         fs::create_dir_all(home.join(".codex")).unwrap();
 
@@ -453,15 +524,16 @@ mod tests {
             &ctx(&home),
             static_key_params(),
             &[],
-            CredentialGate::Unverifiable {
+            gate(CredentialGate::Unverifiable {
                 gateway: "http://127.0.0.1:1".into(),
                 detail: "connection refused".into(),
-            },
+            }),
             &mut |_, _| {
                 attempted += 1;
                 Ok(())
             },
-        );
+        )
+        .await;
 
         let error = result.expect_err("an unverifiable credential must fail the run");
         assert!(
@@ -472,8 +544,8 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn should_configure_every_detected_tool_with_a_verified_credential() {
+    #[tokio::test]
+    async fn should_configure_every_detected_tool_with_a_verified_credential() {
         let home = temp_home("verified");
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::create_dir_all(home.join(".codex")).unwrap();
@@ -492,13 +564,14 @@ mod tests {
                 &ctx(&home),
                 static_key_params(),
                 &[],
-                CredentialGate::Verified { expiry },
+                gate(CredentialGate::Verified { expiry }),
                 &mut |tool, params| {
                     assert_eq!(params.api_key.as_deref(), Some("sk-static"));
                     seen.push(tool);
                     Ok(())
                 },
             )
+            .await
             .unwrap_or_else(|error| panic!("{expiry:?} must configure tools: {error}"));
             assert_eq!(seen, vec![AiTool::ClaudeCode, AiTool::Codex], "{expiry:?}");
         }

@@ -1,17 +1,28 @@
 //! Liveness and expiry of the Gateway session credential that `relay setup` saves.
 
+use std::time::Duration as StdDuration;
+
 use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
 use serde_json::Value;
 
 pub const EXPIRY_WARNING_WINDOW: Duration = Duration::hours(24);
 pub const REENROLL_HINT: &str = "Run `litellm-relay setup` to sign in again.";
+pub const CREDENTIAL_CHECK_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CredentialCheck {
     Valid,
-    Rejected { status: u16, detail: String },
-    Unverifiable { detail: String },
+    /// Authenticated, but the Gateway does not allow this key on the probe route.
+    Restricted {
+        detail: String,
+    },
+    Rejected {
+        detail: String,
+    },
+    Unverifiable {
+        detail: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -22,7 +33,17 @@ pub enum ExpiryState {
     Expired { at: DateTime<Utc> },
 }
 
-/// Ask the Gateway whether it still accepts `api_key`; only 2xx or 401/403 is conclusive.
+/// HTTP client for credential probes, bounded so a silent Gateway never hangs a caller.
+pub fn check_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(CREDENTIAL_CHECK_TIMEOUT)
+        .build()
+        .expect("reqwest client configuration should be valid")
+}
+
+/// Ask the Gateway whether it still accepts `api_key`: 2xx is valid, 401 is a
+/// rejection, 403 is an authenticated key the Gateway will not serve on this
+/// route, and everything else leaves the question open.
 pub async fn check_credential(
     http: &reqwest::Client,
     gateway_url: &str,
@@ -41,24 +62,31 @@ pub async fn check_credential(
     if status.is_success() {
         return CredentialCheck::Valid;
     }
-    if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-        return CredentialCheck::Unverifiable {
-            detail: format!("HTTP {}", status.as_u16()),
-        };
-    }
-    let body = response.text().await.unwrap_or_default();
-    CredentialCheck::Rejected {
-        status: status.as_u16(),
-        detail: rejection_detail(&body).unwrap_or_else(|| status.to_string()),
+    let message = gateway_message(&response.text().await.unwrap_or_default());
+    match status {
+        StatusCode::UNAUTHORIZED => CredentialCheck::Rejected {
+            detail: message.unwrap_or_else(|| status.to_string()),
+        },
+        StatusCode::FORBIDDEN => CredentialCheck::Restricted {
+            detail: message.unwrap_or_else(|| status.to_string()),
+        },
+        _ => CredentialCheck::Unverifiable {
+            detail: match message {
+                Some(message) => format!("HTTP {}: {message}", status.as_u16()),
+                None => format!("HTTP {}", status.as_u16()),
+            },
+        },
     }
 }
 
-fn rejection_detail(body: &str) -> Option<String> {
-    serde_json::from_str::<Value>(body)
-        .ok()?
-        .get("error")?
-        .get("message")?
-        .as_str()
+/// The Gateway's own explanation, from either its `{"error":{"message"}}` or its
+/// FastAPI `{"detail"}` error shape.
+fn gateway_message(body: &str) -> Option<String> {
+    let json = serde_json::from_str::<Value>(body).ok()?;
+    json.get("error")
+        .and_then(|error| error.get("message"))
+        .or_else(|| json.get("detail"))
+        .and_then(Value::as_str)
         .map(str::to_string)
 }
 
@@ -76,17 +104,14 @@ pub fn expiry_state(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Ex
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration as StdDuration;
+pub(crate) mod test_support {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
 
-    const EXPIRED_KEY_BODY: &str = r#"{"error":{"message":"Authentication Error - Expired Key. Key Expiry time 2026-09-21 22:27:58.096000+00:00 and current time 2026-09-21 22:28:15.211000+00:00","type":"expired_key","code":"401"}}"#;
-
-    async fn serve_once(status_line: &str, body: &str) -> String {
+    /// Serve one HTTP response and return the base URL to reach it.
+    pub(crate) async fn serve_once(status_line: &str, body: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let response = format!(
@@ -103,19 +128,35 @@ mod tests {
         base_url
     }
 
-    async fn unused_port_url() -> String {
+    /// Accept one connection and hold it open without answering until `release` fires.
+    pub(crate) async fn serve_hung_until(release: tokio::sync::oneshot::Receiver<()>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = release.await;
+            drop(stream);
+        });
+        base_url
+    }
+
+    pub(crate) async fn unused_port_url() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         base_url
     }
+}
 
-    fn client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .timeout(StdDuration::from_secs(5))
-            .build()
-            .unwrap()
-    }
+#[cfg(test)]
+mod tests {
+    use super::{
+        test_support::{serve_once, unused_port_url},
+        *,
+    };
+
+    const EXPIRED_KEY_BODY: &str = r#"{"error":{"message":"Authentication Error - Expired Key. Key Expiry time 2026-09-21 22:27:58.096000+00:00 and current time 2026-09-21 22:28:15.211000+00:00","type":"expired_key","code":"401"}}"#;
+    const ROUTE_NOT_ALLOWED_BODY: &str = r#"{"detail":"Virtual key is not allowed to call this route. Only allowed to call routes: ['/chat/completions', '/v1/chat/completions']. Tried to call route: /v1/models"}"#;
 
     fn at(rfc3339: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(rfc3339)
@@ -127,7 +168,7 @@ mod tests {
     async fn should_accept_credential_the_gateway_accepts() {
         let gateway = serve_once("200 OK", r#"{"data":[]}"#).await;
         assert_eq!(
-            check_credential(&client(), &gateway, "sk-live").await,
+            check_credential(&check_client(), &gateway, "sk-live").await,
             CredentialCheck::Valid
         );
     }
@@ -135,11 +176,10 @@ mod tests {
     #[tokio::test]
     async fn should_reject_credential_with_the_gateway_message() {
         let gateway = serve_once("401 Unauthorized", EXPIRED_KEY_BODY).await;
-        let check = check_credential(&client(), &format!("{gateway}/"), "sk-expired").await;
-        let CredentialCheck::Rejected { status, detail } = check else {
+        let check = check_credential(&check_client(), &format!("{gateway}/"), "sk-expired").await;
+        let CredentialCheck::Rejected { detail } = check else {
             panic!("expected Rejected, got {check:?}");
         };
-        assert_eq!(status, 401);
         assert!(
             detail.starts_with("Authentication Error - Expired Key"),
             "{detail}"
@@ -149,12 +189,22 @@ mod tests {
 
     #[tokio::test]
     async fn should_fall_back_to_status_line_when_rejection_body_is_not_json() {
-        let gateway = serve_once("403 Forbidden", "nope").await;
+        let gateway = serve_once("401 Unauthorized", "nope").await;
         assert_eq!(
-            check_credential(&client(), &gateway, "sk-forbidden").await,
+            check_credential(&check_client(), &gateway, "sk-forbidden").await,
             CredentialCheck::Rejected {
-                status: 403,
-                detail: "403 Forbidden".into(),
+                detail: "401 Unauthorized".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn should_report_route_restricted_key_as_restricted_not_rejected() {
+        let gateway = serve_once("403 Forbidden", ROUTE_NOT_ALLOWED_BODY).await;
+        assert_eq!(
+            check_credential(&check_client(), &gateway, "sk-chat-only").await,
+            CredentialCheck::Restricted {
+                detail: "Virtual key is not allowed to call this route. Only allowed to call routes: ['/chat/completions', '/v1/chat/completions']. Tried to call route: /v1/models".into(),
             }
         );
     }
@@ -163,7 +213,7 @@ mod tests {
     async fn should_treat_gateway_errors_as_unverifiable() {
         let gateway = serve_once("502 Bad Gateway", "").await;
         assert_eq!(
-            check_credential(&client(), &gateway, "sk-live").await,
+            check_credential(&check_client(), &gateway, "sk-live").await,
             CredentialCheck::Unverifiable {
                 detail: "HTTP 502".into(),
             }
@@ -171,9 +221,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_carry_the_gateway_message_on_unverifiable_statuses() {
+        let gateway = serve_once(
+            "400 Bad Request",
+            r#"{"error":{"message":"Budget has been exceeded! Current cost: 1.2, Max budget: 1.0","type":"budget_exceeded","code":"400"}}"#,
+        )
+        .await;
+        assert_eq!(
+            check_credential(&check_client(), &gateway, "sk-live").await,
+            CredentialCheck::Unverifiable {
+                detail: "HTTP 400: Budget has been exceeded! Current cost: 1.2, Max budget: 1.0"
+                    .into(),
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn should_treat_unreachable_gateway_as_unverifiable() {
         let gateway = unused_port_url().await;
-        let check = check_credential(&client(), &gateway, "sk-live").await;
+        let check = check_credential(&check_client(), &gateway, "sk-live").await;
         let CredentialCheck::Unverifiable { detail } = check else {
             panic!("expected Unverifiable, got {check:?}");
         };

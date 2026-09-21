@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use crate::{
     apps::AppAttribution,
     config::RelayConfig,
-    credential::{check_credential, expiry_state, CredentialCheck, ExpiryState},
+    credential::{check_client, check_credential, expiry_state, CredentialCheck, ExpiryState},
     system::hostname,
     traffic::TrafficClassification,
 };
@@ -24,7 +24,7 @@ pub struct GatewayClient {
     config: Arc<RelayConfig>,
     http_client: reqwest::Client,
     last_shadow_by_host: Mutex<HashMap<String, Instant>>,
-    credential_check: Mutex<Option<CachedCredentialCheck>>,
+    credential_cache: Arc<CredentialCache>,
 }
 
 #[derive(Clone)]
@@ -32,6 +32,78 @@ struct CachedCredentialCheck {
     cached_at: Instant,
     checked_at: DateTime<Utc>,
     check: CredentialCheck,
+}
+
+/// The live credential check behind `/api/status`. A fresh entry is served as
+/// is, a stale one is served immediately while a single background probe
+/// replaces it, so only the very first call after boot waits on the Gateway.
+struct CredentialCache {
+    ttl: Duration,
+    http: reqwest::Client,
+    state: StdMutex<CredentialCacheState>,
+}
+
+#[derive(Default)]
+struct CredentialCacheState {
+    entry: Option<CachedCredentialCheck>,
+    refreshing: bool,
+}
+
+impl CredentialCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            http: check_client(),
+            state: StdMutex::new(CredentialCacheState::default()),
+        }
+    }
+
+    async fn checked(self: &Arc<Self>, gateway_url: &str, api_key: &str) -> CachedCredentialCheck {
+        let entry = self.lock_state().entry.clone();
+        match entry {
+            Some(entry) if entry.cached_at.elapsed() < self.ttl => entry,
+            Some(stale) => {
+                self.refresh_in_background(gateway_url, api_key);
+                stale
+            }
+            None => self.refresh(gateway_url, api_key).await,
+        }
+    }
+
+    async fn refresh(&self, gateway_url: &str, api_key: &str) -> CachedCredentialCheck {
+        let check = check_credential(&self.http, gateway_url, api_key).await;
+        let fresh = CachedCredentialCheck {
+            cached_at: Instant::now(),
+            checked_at: Utc::now(),
+            check,
+        };
+        let mut state = self.lock_state();
+        state.entry = Some(fresh.clone());
+        state.refreshing = false;
+        fresh
+    }
+
+    fn refresh_in_background(self: &Arc<Self>, gateway_url: &str, api_key: &str) {
+        {
+            let mut state = self.lock_state();
+            if state.refreshing {
+                return;
+            }
+            state.refreshing = true;
+        }
+        let cache = Arc::clone(self);
+        let gateway_url = gateway_url.to_string();
+        let api_key = api_key.to_string();
+        tokio::spawn(async move {
+            cache.refresh(&gateway_url, &api_key).await;
+        });
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, CredentialCacheState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl GatewayClient {
@@ -45,14 +117,13 @@ impl GatewayClient {
             config,
             http_client,
             last_shadow_by_host: Mutex::new(HashMap::new()),
-            credential_check: Mutex::new(None),
+            credential_cache: Arc::new(CredentialCache::new(CREDENTIAL_CHECK_TTL)),
         }
     }
 
-    /// Stored credential state for `/api/status`, with the live check cached for `CREDENTIAL_CHECK_TTL`.
+    /// Stored credential state for `/api/status`; the live check comes from `CredentialCache`.
     pub async fn credential_status(&self) -> CredentialStatus {
-        let now = Utc::now();
-        let expiry = expiry_state(self.config.gateway_expires_at, now);
+        let expiry = expiry_state(self.config.gateway_expires_at, Utc::now());
         let Some(api_key) = &self.config.gateway_api_key else {
             return CredentialStatus {
                 configured: false,
@@ -63,24 +134,14 @@ impl GatewayClient {
                 expiry,
             };
         };
-        let mut cache = self.credential_check.lock().await;
-        let cached = match cache.as_ref() {
-            Some(cached) if cached.cached_at.elapsed() < CREDENTIAL_CHECK_TTL => cached.clone(),
-            _ => {
-                let fresh = CachedCredentialCheck {
-                    cached_at: Instant::now(),
-                    checked_at: now,
-                    check: check_credential(&self.http_client, &self.config.gateway_url, api_key)
-                        .await,
-                };
-                *cache = Some(fresh.clone());
-                fresh
-            }
-        };
+        let checked = self
+            .credential_cache
+            .checked(&self.config.gateway_url, api_key)
+            .await;
         CredentialStatus {
             configured: true,
-            check: Some(cached.check),
-            checked_at: Some(cached.checked_at),
+            check: Some(checked.check),
+            checked_at: Some(checked.checked_at),
             enrolled_at: self.config.gateway_enrolled_at,
             expires_at: self.config.gateway_expires_at,
             expiry,
@@ -274,7 +335,8 @@ impl CredentialStatus {
         let (state, detail) = match &self.check {
             None => ("missing", None),
             Some(CredentialCheck::Valid) => ("valid", None),
-            Some(CredentialCheck::Rejected { detail, .. }) => ("rejected", Some(detail.as_str())),
+            Some(CredentialCheck::Restricted { detail }) => ("restricted", Some(detail.as_str())),
+            Some(CredentialCheck::Rejected { detail }) => ("rejected", Some(detail.as_str())),
             Some(CredentialCheck::Unverifiable { detail }) => {
                 ("unverifiable", Some(detail.as_str()))
             }
@@ -444,7 +506,6 @@ mod tests {
         let status = CredentialStatus {
             configured: true,
             check: Some(CredentialCheck::Rejected {
-                status: 401,
                 detail: "Authentication Error - Expired Key".into(),
             }),
             checked_at: Some(at("2026-09-21T22:28:15Z")),
@@ -493,5 +554,72 @@ mod tests {
         };
 
         assert_eq!(status.to_json()["expiry"], "ok");
+    }
+
+    #[test]
+    fn should_report_restricted_credential_with_gateway_detail() {
+        let status = CredentialStatus {
+            configured: true,
+            check: Some(CredentialCheck::Restricted {
+                detail: "Virtual key is not allowed to call this route".into(),
+            }),
+            checked_at: Some(at("2026-09-21T23:00:00Z")),
+            enrolled_at: None,
+            expires_at: None,
+            expiry: ExpiryState::Unknown,
+        };
+
+        let payload = status.to_json();
+        assert_eq!(payload["state"], "restricted");
+        assert_eq!(
+            payload["detail"],
+            "Virtual key is not allowed to call this route"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_serve_the_stale_check_while_the_gateway_hangs_and_refresh_behind_it() {
+        use crate::credential::test_support::{serve_hung_until, serve_once};
+        use std::time::Duration;
+
+        let cache = Arc::new(CredentialCache::new(Duration::ZERO));
+        let live = serve_once("200 OK", r#"{"data":[]}"#).await;
+        assert_eq!(
+            cache.checked(&live, "sk-live").await.check,
+            CredentialCheck::Valid
+        );
+
+        let (release, released) = tokio::sync::oneshot::channel();
+        let hung = serve_hung_until(released).await;
+        let started = Instant::now();
+        let served = cache.checked(&hung, "sk-live").await;
+        assert_eq!(served.check, CredentialCheck::Valid);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a stale entry must be served without waiting on the Gateway, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            cache.lock_state().refreshing,
+            "the stale read must start exactly one background refresh"
+        );
+
+        release.send(()).unwrap();
+        let refreshed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let entry = cache.checked(&hung, "sk-live").await;
+                if entry.check != CredentialCheck::Valid {
+                    return entry;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the background refresh must land once the Gateway answers");
+        assert!(
+            matches!(refreshed.check, CredentialCheck::Unverifiable { .. }),
+            "{:?}",
+            refreshed.check
+        );
     }
 }

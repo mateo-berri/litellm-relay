@@ -530,22 +530,25 @@ function CredentialLine({ credential }: { credential?: RelayCredential }) {
       ? expiresAt
         ? `valid, expires ${expiresAt}`
         : "valid"
-      : state === "rejected"
-        ? "rejected"
-        : state === "unverifiable"
-          ? "unverifiable"
-          : state === "missing"
-            ? "not configured"
-            : "-"
+      : state === "restricted"
+        ? "restricted"
+        : state === "rejected"
+          ? "rejected"
+          : state === "unverifiable"
+            ? "unverifiable"
+            : state === "missing"
+              ? "not configured"
+              : "-"
   const tone =
     state === "rejected"
       ? "text-destructive"
-      : state === "unverifiable" || credential?.expiry === "expiring_soon"
+      : state === "restricted" || state === "unverifiable" || credential?.expiry === "expiring_soon"
         ? "text-amber-600 dark:text-amber-400"
         : state === "missing"
           ? "text-muted-foreground"
           : ""
-  const detail = state === "rejected" || state === "unverifiable" ? credential?.detail : null
+  const detail =
+    state === "restricted" || state === "rejected" || state === "unverifiable" ? credential?.detail : null
   return (
     <div className="grid gap-1">
       <div className="text-xs uppercase tracking-wide text-muted-foreground">Gateway credential</div>
