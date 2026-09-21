@@ -38,7 +38,11 @@ login and every `RELAY_AUTOCONFIGURE_INTERVAL` seconds, default 3600):
 | `ai.litellm.relay.autoconfigure-desktop` (LaunchDaemon) | root | Claude Desktop | its managed plist lives in the root-owned `/Library/Managed Preferences` |
 
 The root daemon pins `HOME` to the installing user so it reads that user's Relay
-config while running as root. Installing it needs root; `install.sh` uses `sudo`
+config while running as root. It also runs whenever `/Library/Managed Preferences`
+changes: on an MDM-enrolled Mac a managed-preferences refresh (login, a profile
+push) regenerates that directory from the installed profiles and drops the plist,
+and the daemon writes it back within seconds, leaving it alone when it is already
+current. Installing it needs root; `install.sh` uses `sudo`
 when not already root (the macOS `.pkg` postinstall already runs as root). If it
 can't get root, Claude Code and Codex still auto-configure and Relay prints a
 warning for Claude Desktop.

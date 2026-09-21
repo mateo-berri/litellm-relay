@@ -522,7 +522,9 @@ launchctl enable "gui/$(id -u)/ai.litellm.relay"
 # lives:
 #   - a per-user LaunchAgent for the user-writable tools (Claude Code, Codex)
 #   - a root LaunchDaemon for Claude Desktop, whose managed settings live in the
-#     root-owned /Library/Managed Preferences and cannot be written as the user
+#     root-owned /Library/Managed Preferences and cannot be written as the user;
+#     it also watches that directory, since an MDM managed-preferences refresh
+#     regenerates it from the installed profiles and drops the plist
 AUTOCONFIGURE_PLIST="$HOME/Library/LaunchAgents/ai.litellm.relay.autoconfigure.plist"
 DESKTOP_DAEMON_LABEL="ai.litellm.relay.autoconfigure-desktop"
 DESKTOP_DAEMON_PLIST="/Library/LaunchDaemons/$DESKTOP_DAEMON_LABEL.plist"
@@ -558,6 +560,10 @@ install_desktop_daemon() {
     <key>HOME</key>
     <string>$HOME</string>
   </dict>
+  <key>WatchPaths</key>
+  <array>
+    <string>/Library/Managed Preferences</string>
+  </array>
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
