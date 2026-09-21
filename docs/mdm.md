@@ -123,3 +123,10 @@ profile.
 Using `--api-key` (or `gateway.api_key` in the managed config) writes a static
 Gateway key to every device. Prefer per-user browser SSO where your Gateway
 supports it.
+
+The per-user LaunchAgent re-runs `autoconfigure` at login and on its interval.
+Each run checks the stored Gateway credential first. If the Gateway rejects it,
+the run leaves the Codex and Claude Code configs untouched and exits non-zero,
+so an expired SSO session shows up in the LaunchAgent's exit status and in the
+`credential` block of `/api/status` instead of being rewritten into the tools
+every hour

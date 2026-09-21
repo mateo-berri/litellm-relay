@@ -11,13 +11,27 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::{
-    apps::AppAttribution, config::RelayConfig, system::hostname, traffic::TrafficClassification,
+    apps::AppAttribution,
+    config::RelayConfig,
+    credential::{check_credential, expiry_state, CredentialCheck, ExpiryState},
+    system::hostname,
+    traffic::TrafficClassification,
 };
+
+const CREDENTIAL_CHECK_TTL: Duration = Duration::from_secs(60);
 
 pub struct GatewayClient {
     config: Arc<RelayConfig>,
     http_client: reqwest::Client,
     last_shadow_by_host: Mutex<HashMap<String, Instant>>,
+    credential_check: Mutex<Option<CachedCredentialCheck>>,
+}
+
+#[derive(Clone)]
+struct CachedCredentialCheck {
+    cached_at: Instant,
+    checked_at: DateTime<Utc>,
+    check: CredentialCheck,
 }
 
 impl GatewayClient {
@@ -31,6 +45,45 @@ impl GatewayClient {
             config,
             http_client,
             last_shadow_by_host: Mutex::new(HashMap::new()),
+            credential_check: Mutex::new(None),
+        }
+    }
+
+    /// Stored credential state for `/api/status`, with the live check cached for `CREDENTIAL_CHECK_TTL`.
+    pub async fn credential_status(&self) -> CredentialStatus {
+        let now = Utc::now();
+        let expiry = expiry_state(self.config.gateway_expires_at, now);
+        let Some(api_key) = &self.config.gateway_api_key else {
+            return CredentialStatus {
+                configured: false,
+                check: None,
+                checked_at: None,
+                enrolled_at: self.config.gateway_enrolled_at,
+                expires_at: self.config.gateway_expires_at,
+                expiry,
+            };
+        };
+        let mut cache = self.credential_check.lock().await;
+        let cached = match cache.as_ref() {
+            Some(cached) if cached.cached_at.elapsed() < CREDENTIAL_CHECK_TTL => cached.clone(),
+            _ => {
+                let fresh = CachedCredentialCheck {
+                    cached_at: Instant::now(),
+                    checked_at: now,
+                    check: check_credential(&self.http_client, &self.config.gateway_url, api_key)
+                        .await,
+                };
+                *cache = Some(fresh.clone());
+                fresh
+            }
+        };
+        CredentialStatus {
+            configured: true,
+            check: Some(cached.check),
+            checked_at: Some(cached.checked_at),
+            enrolled_at: self.config.gateway_enrolled_at,
+            expires_at: self.config.gateway_expires_at,
+            expiry,
         }
     }
 
@@ -206,6 +259,44 @@ pub struct IngestResult {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CredentialStatus {
+    pub configured: bool,
+    pub check: Option<CredentialCheck>,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub enrolled_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub expiry: ExpiryState,
+}
+
+impl CredentialStatus {
+    pub fn to_json(&self) -> Value {
+        let (state, detail) = match &self.check {
+            None => ("missing", None),
+            Some(CredentialCheck::Valid) => ("valid", None),
+            Some(CredentialCheck::Rejected { detail, .. }) => ("rejected", Some(detail.as_str())),
+            Some(CredentialCheck::Unverifiable { detail }) => {
+                ("unverifiable", Some(detail.as_str()))
+            }
+        };
+        let expiry = match self.expiry {
+            ExpiryState::Unknown => "unknown",
+            ExpiryState::Ok { .. } => "ok",
+            ExpiryState::ExpiringSoon { .. } => "expiring_soon",
+            ExpiryState::Expired { .. } => "expired",
+        };
+        json!({
+            "configured": self.configured,
+            "state": state,
+            "detail": detail,
+            "checked_at": self.checked_at.map(|at| at.to_rfc3339()),
+            "enrolled_at": self.enrolled_at.map(|at| at.to_rfc3339()),
+            "expires_at": self.expires_at.map(|at| at.to_rfc3339()),
+            "expiry": expiry,
+        })
+    }
+}
+
 fn build_shadow_payload(event: &Value, config: &RelayConfig, event_id: &str) -> Value {
     let host = event
         .get("host")
@@ -289,5 +380,118 @@ mod tests {
         assert_eq!(metadata["process_lookup_status"], "not_attempted");
         assert!(metadata["process_identity"].is_null());
         assert_eq!(metadata["traffic_reason"], "openai_api_path");
+    }
+
+    fn at(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn should_report_missing_credential() {
+        let status = CredentialStatus {
+            configured: false,
+            check: None,
+            checked_at: None,
+            enrolled_at: None,
+            expires_at: None,
+            expiry: ExpiryState::Unknown,
+        };
+
+        assert_eq!(
+            status.to_json(),
+            json!({
+                "configured": false,
+                "state": "missing",
+                "detail": null,
+                "checked_at": null,
+                "enrolled_at": null,
+                "expires_at": null,
+                "expiry": "unknown",
+            })
+        );
+    }
+
+    #[test]
+    fn should_report_valid_credential_with_timestamps() {
+        let expires_at = at("2026-09-22T21:27:58.096Z");
+        let status = CredentialStatus {
+            configured: true,
+            check: Some(CredentialCheck::Valid),
+            checked_at: Some(at("2026-09-21T22:00:00Z")),
+            enrolled_at: Some(at("2026-09-21T21:27:58Z")),
+            expires_at: Some(expires_at),
+            expiry: ExpiryState::ExpiringSoon { at: expires_at },
+        };
+
+        assert_eq!(
+            status.to_json(),
+            json!({
+                "configured": true,
+                "state": "valid",
+                "detail": null,
+                "checked_at": "2026-09-21T22:00:00+00:00",
+                "enrolled_at": "2026-09-21T21:27:58+00:00",
+                "expires_at": "2026-09-22T21:27:58.096+00:00",
+                "expiry": "expiring_soon",
+            })
+        );
+    }
+
+    #[test]
+    fn should_report_rejected_credential_with_gateway_detail() {
+        let status = CredentialStatus {
+            configured: true,
+            check: Some(CredentialCheck::Rejected {
+                status: 401,
+                detail: "Authentication Error - Expired Key".into(),
+            }),
+            checked_at: Some(at("2026-09-21T22:28:15Z")),
+            enrolled_at: None,
+            expires_at: None,
+            expiry: ExpiryState::Unknown,
+        };
+
+        let payload = status.to_json();
+        assert_eq!(payload["state"], "rejected");
+        assert_eq!(payload["detail"], "Authentication Error - Expired Key");
+        assert_eq!(payload["expiry"], "unknown");
+    }
+
+    #[test]
+    fn should_report_unverifiable_credential_and_expired_state() {
+        let expires_at = at("2026-09-21T22:27:58Z");
+        let status = CredentialStatus {
+            configured: true,
+            check: Some(CredentialCheck::Unverifiable {
+                detail: "HTTP 502".into(),
+            }),
+            checked_at: Some(at("2026-09-21T23:00:00Z")),
+            enrolled_at: None,
+            expires_at: Some(expires_at),
+            expiry: ExpiryState::Expired { at: expires_at },
+        };
+
+        let payload = status.to_json();
+        assert_eq!(payload["state"], "unverifiable");
+        assert_eq!(payload["detail"], "HTTP 502");
+        assert_eq!(payload["expiry"], "expired");
+        assert_eq!(payload["expires_at"], "2026-09-21T22:27:58+00:00");
+    }
+
+    #[test]
+    fn should_report_ok_expiry() {
+        let expires_at = at("2026-09-30T00:00:00Z");
+        let status = CredentialStatus {
+            configured: true,
+            check: Some(CredentialCheck::Valid),
+            checked_at: None,
+            enrolled_at: None,
+            expires_at: Some(expires_at),
+            expiry: ExpiryState::Ok { at: expires_at },
+        };
+
+        assert_eq!(status.to_json()["expiry"], "ok");
     }
 }

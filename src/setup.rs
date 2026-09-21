@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 
 use crate::{
     ai_tools::{autoconfigure, AutoConfigureParams},
@@ -25,16 +26,16 @@ pub async fn run_setup(gateway_url: Option<String>, api_key: Option<String>) -> 
 
     println!();
     print_step(2, 4, "Sign in");
-    let (api_key, user_id, team_id) = match api_key {
+    let (api_key, user_id, team_id, expires_at) = match api_key {
         Some(api_key) => {
             println!("  Using API key from command line.");
-            (api_key, None, None)
+            (api_key, None, None, None)
         }
         None if prompt_browser_sso() => {
             let auth = GatewaySsoClient::new().login(&gateway_url).await?;
-            (auth.api_key, auth.user_id, auth.team_id)
+            (auth.api_key, auth.user_id, auth.team_id, auth.expires_at)
         }
-        None => (prompt("Gateway API key", ""), None, None),
+        None => (prompt("Gateway API key", ""), None, None, None),
     };
 
     if api_key.trim().is_empty() {
@@ -45,15 +46,22 @@ pub async fn run_setup(gateway_url: Option<String>, api_key: Option<String>) -> 
     print_step(3, 4, "Save local Relay config");
     settings.gateway.url = gateway_url.trim_end_matches('/').to_string();
     settings.gateway.api_key = Some(api_key.trim().to_string());
+    settings.gateway.enrolled_at = Some(Utc::now());
+    settings.gateway.expires_at = expires_at;
     let config_path = save_settings(&settings)?;
-    print_setup_complete(&config_path, user_id.as_deref(), team_id.as_deref());
+    print_setup_complete(
+        &config_path,
+        user_id.as_deref(),
+        team_id.as_deref(),
+        expires_at,
+    );
 
     println!();
     print_step(4, 4, "Configure installed AI tools");
     // Detect and wire up every AI tool on this device. `autoconfigure` reads
     // the config just saved and prefers the IdP, falling back to the Gateway
     // key on non-SSO setups.
-    if let Err(error) = autoconfigure(AutoConfigureParams::default(), &[]) {
+    if let Err(error) = autoconfigure(AutoConfigureParams::default(), &[]).await {
         eprintln!("  Skipping AI tool auto-configuration: {error:#}");
     }
     Ok(())
