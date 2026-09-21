@@ -33,6 +33,8 @@ A static key is stored in that file in clear, readable by every local account li
 
 The developer only launches Claude Desktop. It opens on the gateway welcome screen ("Your organization has set up Claude to run through a custom inference gateway. No Claude.ai account needed.") and answers through the Gateway.
 
+That welcome screen also offers "Or sign in with Claude.ai", and the app remembers that choice: a developer who picked it once keeps booting on Claude.ai even though the managed configuration is in place, until they quit the app and delete the `deploymentMode` key from `~/Library/Application Support/Claude-3p/claude_desktop_config.json`, or the fleet's MDM profile also sets `disableDeploymentModeChooser` to true, which hides the option.
+
 ![Claude Desktop gateway welcome screen](img/claude-desktop-welcome.png)
 
 ![Claude Desktop answering through the Gateway](img/claude-desktop-answer.png)
