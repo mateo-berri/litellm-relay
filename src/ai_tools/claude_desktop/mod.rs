@@ -284,9 +284,22 @@ fn find_per_user_override(
 fn replace_atomically(path: &Path, rendered: &[u8]) -> io::Result<()> {
     let staged = path.with_extension("relay-tmp");
     fs::write(&staged, rendered)?;
-    fs::rename(&staged, path).inspect_err(|_| {
-        let _ = fs::remove_file(&staged);
-    })
+    mark_world_readable(&staged)
+        .and_then(|()| fs::rename(&staged, path))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&staged);
+        })
+}
+
+#[cfg(unix)]
+fn mark_world_readable(staged: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(staged, fs::Permissions::from_mode(0o644))
+}
+
+#[cfg(not(unix))]
+fn mark_world_readable(_staged: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn render_managed_settings(
@@ -753,6 +766,35 @@ mod tests {
             vec![std::ffi::OsString::from(
                 "com.anthropic.claudefordesktop.plist"
             )]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_leave_the_managed_file_world_readable_whatever_mode_the_staging_file_had() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("mode");
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            None,
+        );
+        fs::create_dir_all(layout.managed_dir()).unwrap();
+        let staged = layout.path.with_extension("relay-tmp");
+        fs::write(&staged, b"").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+
+        write_managed_settings(&layout, &doc).unwrap();
+
+        assert_eq!(
+            fs::metadata(&layout.path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "Claude Desktop reads the root-owned plist as the signed-in user"
         );
         fs::remove_dir_all(&dir).unwrap();
     }
