@@ -1,9 +1,17 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 
 use crate::config::{load_settings, save_settings, RelaySettings};
+
+const MANAGED_SETTINGS_PATH_ENV: &str = "CLAUDE_DESKTOP_MANAGED_SETTINGS";
+const MACOS_MANAGED_PLIST: &str =
+    "/Library/Managed Preferences/com.anthropic.claudefordesktop.plist";
+const LINUX_MANAGED_JSON: &str = "/etc/claude-desktop/managed-settings.json";
 
 /// Inputs for wiring Claude Desktop (third-party mode) to route through the
 /// Gateway. Supplied by the MDM package or interactively; any field left unset
@@ -28,11 +36,12 @@ pub struct OnboardDesktopParams {
     pub quiet: bool,
 }
 
-/// Writes `/etc/claude-desktop/managed-settings.json` so Claude Desktop routes
-/// inference through the Gateway. The app reads this root-owned file on launch
-/// (see the Anthropic "LLM gateway" third-party docs), switches into gateway
-/// mode, and — in SSO mode — prompts the developer to sign in through their
-/// browser on first use.
+/// Writes the managed configuration Claude Desktop reads on launch so it routes
+/// inference through the Gateway: the `com.anthropic.claudefordesktop` managed
+/// preferences plist on macOS, `/etc/claude-desktop/managed-settings.json` on
+/// Linux (see the Anthropic "LLM gateway" third-party docs). The app switches
+/// into gateway mode and — in SSO mode — prompts the developer to sign in
+/// through their browser on first use.
 pub fn onboard_desktop(params: OnboardDesktopParams) -> Result<()> {
     let mut settings = load_settings()?;
     if let Some(gateway_url) = params.gateway_url {
@@ -64,9 +73,12 @@ pub fn onboard_desktop(params: OnboardDesktopParams) -> Result<()> {
     }
 
     let document = build_managed_settings(&settings, sso.as_ref());
-    let path = write_managed_settings(&document)?;
+    let written = write_managed_settings(&ManagedLayout::for_host(), &document)?;
     save_settings(&settings)?;
 
+    if let Some(stale) = &written.removed_stale {
+        println!("Removed stale {}", stale.display());
+    }
     if !params.quiet {
         println!("Claude Desktop is wired to {}", settings.gateway.url);
         match &sso {
@@ -79,7 +91,7 @@ pub fn onboard_desktop(params: OnboardDesktopParams) -> Result<()> {
             }
             None => println!("Credential: static Gateway API key"),
         }
-        println!("Wrote {}", path.display());
+        println!("Wrote {}", written.path.display());
         println!("Restart Claude Desktop to pick up the managed configuration.");
     }
     Ok(())
@@ -92,9 +104,10 @@ struct SsoConfig {
     redirect_port: Option<u16>,
 }
 
-/// Builds the top-level JSON object Claude Desktop reads from
-/// `/etc/claude-desktop/managed-settings.json`. Keys match the Anthropic
-/// third-party configuration reference exactly.
+/// Builds the top-level object Claude Desktop reads from its managed
+/// configuration. Keys match the Anthropic third-party configuration reference
+/// exactly; the same document is rendered as a plist on macOS and as JSON on
+/// Linux.
 fn build_managed_settings(settings: &RelaySettings, sso: Option<&SsoConfig>) -> Map<String, Value> {
     let mut root = Map::new();
     root.insert("inferenceProvider".into(), Value::String("gateway".into()));
@@ -145,34 +158,164 @@ fn build_managed_settings(settings: &RelaySettings, sso: Option<&SsoConfig>) -> 
     root
 }
 
-fn managed_settings_path() -> PathBuf {
-    if let Ok(path) = env::var("CLAUDE_DESKTOP_MANAGED_SETTINGS") {
-        return PathBuf::from(path);
-    }
-    PathBuf::from("/etc/claude-desktop/managed-settings.json")
+/// On-disk encoding of the managed document, which follows the platform Claude
+/// Desktop is built for rather than any path override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedFormat {
+    MacOsPlist,
+    LinuxJson,
 }
 
-fn write_managed_settings(document: &Map<String, Value>) -> Result<PathBuf> {
-    let path = managed_settings_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| managed_write_error(error, parent))?;
+impl ManagedFormat {
+    fn for_host() -> Self {
+        if cfg!(target_os = "macos") {
+            ManagedFormat::MacOsPlist
+        } else {
+            ManagedFormat::LinuxJson
+        }
     }
-
-    let serialized = serde_json::to_string_pretty(&Value::Object(document.clone()))?;
-    fs::write(&path, format!("{serialized}\n"))
-        .map_err(|error| managed_write_error(error, &path))?;
-    Ok(path)
 }
 
-/// Maps a filesystem error on the managed `/etc/claude-desktop` path to a
-/// concise, actionable message. Permission errors get a short "needs sudo" hint
-/// (surfaced verbatim in the autoconfigure summary) instead of the raw
+/// Where the managed document lives on this host, how it is encoded, and which
+/// file from an earlier Relay layout must go once the new one is in effect.
+/// `CLAUDE_DESKTOP_MANAGED_SETTINGS` overrides the path only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedLayout {
+    path: PathBuf,
+    format: ManagedFormat,
+    stale_path: Option<PathBuf>,
+}
+
+impl ManagedLayout {
+    fn for_host() -> Self {
+        let format = ManagedFormat::for_host();
+        if let Some(path) = env::var_os(MANAGED_SETTINGS_PATH_ENV) {
+            return Self {
+                path: PathBuf::from(path),
+                format,
+                stale_path: None,
+            };
+        }
+        match format {
+            ManagedFormat::MacOsPlist => Self {
+                path: PathBuf::from(MACOS_MANAGED_PLIST),
+                format,
+                stale_path: Some(PathBuf::from(LINUX_MANAGED_JSON)),
+            },
+            ManagedFormat::LinuxJson => Self {
+                path: PathBuf::from(LINUX_MANAGED_JSON),
+                format,
+                stale_path: None,
+            },
+        }
+    }
+
+    fn managed_dir(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("/"))
+    }
+}
+
+struct ManagedWrite {
+    path: PathBuf,
+    removed_stale: Option<PathBuf>,
+}
+
+fn write_managed_settings(
+    layout: &ManagedLayout,
+    document: &Map<String, Value>,
+) -> Result<ManagedWrite> {
+    fs::create_dir_all(layout.managed_dir()).map_err(|error| managed_write_error(error, layout))?;
+    let rendered = render_managed_settings(layout.format, document)?;
+    fs::write(&layout.path, rendered).map_err(|error| managed_write_error(error, layout))?;
+    verify_managed_settings(layout, document)?;
+
+    let removed_stale = match &layout.stale_path {
+        Some(stale) => remove_stale_managed_file(stale)?,
+        None => None,
+    };
+    Ok(ManagedWrite {
+        path: layout.path.clone(),
+        removed_stale,
+    })
+}
+
+fn render_managed_settings(
+    format: ManagedFormat,
+    document: &Map<String, Value>,
+) -> Result<Vec<u8>> {
+    match format {
+        ManagedFormat::MacOsPlist => {
+            let mut rendered = Vec::new();
+            plist::to_writer_xml(&mut rendered, document)
+                .context("failed to render the managed plist")?;
+            Ok(rendered)
+        }
+        ManagedFormat::LinuxJson => {
+            let rendered = serde_json::to_string_pretty(&Value::Object(document.clone()))?;
+            Ok(format!("{rendered}\n").into_bytes())
+        }
+    }
+}
+
+/// Reads the managed file back the way Claude Desktop will and fails when it
+/// does not contain exactly the document just written, so a write that cannot
+/// take effect never reports success.
+fn verify_managed_settings(layout: &ManagedLayout, document: &Map<String, Value>) -> Result<()> {
+    let matches = match layout.format {
+        ManagedFormat::MacOsPlist => {
+            let on_disk: plist::Value = plist::from_file(&layout.path)
+                .with_context(|| format!("failed to read back {}", layout.path.display()))?;
+            on_disk == plist::to_value(document).context("failed to render the managed plist")?
+        }
+        ManagedFormat::LinuxJson => {
+            let contents = fs::read(&layout.path)
+                .with_context(|| format!("failed to read back {}", layout.path.display()))?;
+            let on_disk: Value = serde_json::from_slice(&contents)
+                .with_context(|| format!("failed to read back {}", layout.path.display()))?;
+            on_disk == Value::Object(document.clone())
+        }
+    };
+    if !matches {
+        bail!(
+            "{} does not contain the managed settings just written, so Claude Desktop cannot pick them up",
+            layout.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn remove_stale_managed_file(stale: &Path) -> Result<Option<PathBuf>> {
+    match fs::remove_file(stale) {
+        Ok(()) => {
+            remove_dir_if_empty(stale.parent());
+            Ok(Some(stale.to_path_buf()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "failed to remove the stale {} (it holds the Gateway credential and Claude Desktop never reads it here)",
+            stale.display()
+        ))),
+    }
+}
+
+fn remove_dir_if_empty(dir: Option<&Path>) {
+    if let Some(dir) = dir {
+        let _ = fs::remove_dir(dir);
+    }
+}
+
+/// Maps a filesystem error on the managed location to a concise, actionable
+/// message. Permission errors get a short "needs sudo" hint (surfaced verbatim
+/// in the autoconfigure summary) instead of the raw
 /// "Permission denied (os error 13)".
-fn managed_write_error(error: std::io::Error, path: &std::path::Path) -> anyhow::Error {
-    if error.kind() == std::io::ErrorKind::PermissionDenied {
-        anyhow!("needs sudo (managed dir /etc/claude-desktop must be root-owned)")
+fn managed_write_error(error: io::Error, layout: &ManagedLayout) -> anyhow::Error {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        anyhow!(
+            "needs sudo (managed dir {} is root-owned)",
+            layout.managed_dir().display()
+        )
     } else {
-        anyhow::Error::new(error).context(format!("failed to write {}", path.display()))
+        anyhow::Error::new(error).context(format!("failed to write {}", layout.path.display()))
     }
 }
 
@@ -186,6 +329,35 @@ mod tests {
         settings.gateway.api_key = key.map(str::to_string);
         settings.claude.model = model.into();
         settings
+    }
+
+    fn sso_config() -> SsoConfig {
+        SsoConfig {
+            client_id: "client-123".into(),
+            issuer: "https://login.corp/v2.0".into(),
+            scopes: None,
+            redirect_port: Some(53180),
+        }
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("relay-desktop-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn layout_in(
+        dir: &Path,
+        file: &str,
+        format: ManagedFormat,
+        stale_path: Option<PathBuf>,
+    ) -> ManagedLayout {
+        ManagedLayout {
+            path: dir.join("managed").join(file),
+            format,
+            stale_path,
+        }
     }
 
     #[test]
@@ -217,13 +389,7 @@ mod tests {
     #[test]
     fn should_write_interactive_sso_config_without_api_key() {
         let settings = settings_with("https://gw.corp", Some("sk-secret"), "claude-sonnet-4-5");
-        let sso = SsoConfig {
-            client_id: "client-123".into(),
-            issuer: "https://login.corp/v2.0".into(),
-            scopes: None,
-            redirect_port: Some(53180),
-        };
-        let doc = build_managed_settings(&settings, Some(&sso));
+        let doc = build_managed_settings(&settings, Some(&sso_config()));
 
         assert_eq!(
             doc["inferenceCredentialKind"],
@@ -240,5 +406,223 @@ mod tests {
             Value::String("https://login.corp/v2.0".into())
         );
         assert_eq!(oidc["redirectPort"], json!(53180));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_target_the_managed_preferences_plist_on_macos() {
+        let layout = ManagedLayout::for_host();
+
+        assert_eq!(layout.path, PathBuf::from(MACOS_MANAGED_PLIST));
+        assert_eq!(layout.format, ManagedFormat::MacOsPlist);
+        assert_eq!(
+            layout.stale_path.as_deref(),
+            Some(Path::new(LINUX_MANAGED_JSON)),
+            "the /etc file earlier Relay versions wrote on macOS must be cleaned up"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn should_target_the_etc_json_file_on_linux() {
+        let layout = ManagedLayout::for_host();
+
+        assert_eq!(layout.path, PathBuf::from(LINUX_MANAGED_JSON));
+        assert_eq!(layout.format, ManagedFormat::LinuxJson);
+        assert_eq!(layout.stale_path, None);
+    }
+
+    #[test]
+    fn should_write_a_plist_claude_desktop_can_parse_including_nested_oidc() {
+        let dir = scratch_dir("plist");
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            None,
+        );
+        let settings = settings_with("https://gw.corp", None, "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, Some(&sso_config()));
+
+        let written = write_managed_settings(&layout, &doc).unwrap();
+
+        assert_eq!(written.path, layout.path);
+        let on_disk: plist::Value = plist::from_file(&layout.path).unwrap();
+        let root = on_disk.as_dictionary().expect("plist root must be a dict");
+        assert_eq!(
+            root.get("inferenceGatewayBaseUrl")
+                .and_then(plist::Value::as_string),
+            Some("https://gw.corp")
+        );
+        assert_eq!(
+            root.get("inferenceCredentialKind")
+                .and_then(plist::Value::as_string),
+            Some("interactive")
+        );
+        let models = root
+            .get("inferenceModels")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].as_string(), Some("claude-sonnet-5"));
+        let oidc = root
+            .get("inferenceGatewayOidc")
+            .and_then(plist::Value::as_dictionary)
+            .unwrap();
+        assert_eq!(
+            oidc.get("clientId").and_then(plist::Value::as_string),
+            Some("client-123")
+        );
+        assert_eq!(
+            oidc.get("redirectPort")
+                .and_then(plist::Value::as_unsigned_integer),
+            Some(53180),
+            "the redirect port must stay an integer, not become a string"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_write_json_on_the_linux_layout() {
+        let dir = scratch_dir("json");
+        let layout = layout_in(
+            &dir,
+            "managed-settings.json",
+            ManagedFormat::LinuxJson,
+            None,
+        );
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+
+        write_managed_settings(&layout, &doc).unwrap();
+
+        let on_disk: Value = serde_json::from_slice(&fs::read(&layout.path).unwrap()).unwrap();
+        assert_eq!(on_disk, Value::Object(doc));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_remove_the_stale_etc_file_and_its_dir_after_a_verified_write() {
+        let dir = scratch_dir("stale");
+        let stale = dir
+            .join("etc")
+            .join("claude-desktop")
+            .join("managed-settings.json");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, "{\"inferenceGatewayApiKey\": \"sk-old\"}\n").unwrap();
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            Some(stale.clone()),
+        );
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+
+        let written = write_managed_settings(&layout, &doc).unwrap();
+
+        assert_eq!(written.removed_stale, Some(stale.clone()));
+        assert!(!stale.exists(), "the stale credential file must be gone");
+        assert!(
+            !stale.parent().unwrap().exists(),
+            "the emptied /etc/claude-desktop dir must be gone too"
+        );
+        assert!(layout.path.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_report_nothing_removed_when_no_stale_file_exists() {
+        let dir = scratch_dir("nostale");
+        let stale = dir
+            .join("etc")
+            .join("claude-desktop")
+            .join("managed-settings.json");
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            Some(stale),
+        );
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+
+        let written = write_managed_settings(&layout, &doc).unwrap();
+
+        assert_eq!(written.removed_stale, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_fail_when_the_file_on_disk_is_not_the_document_written() {
+        let dir = scratch_dir("mismatch");
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            None,
+        );
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+        let other = build_managed_settings(
+            &settings_with("https://other.corp", Some("sk-test"), "claude-sonnet-5"),
+            None,
+        );
+        fs::create_dir_all(layout.managed_dir()).unwrap();
+        fs::write(
+            &layout.path,
+            render_managed_settings(ManagedFormat::MacOsPlist, &other).unwrap(),
+        )
+        .unwrap();
+
+        let error = verify_managed_settings(&layout, &doc)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("com.anthropic.claudefordesktop.plist"),
+            "{error}"
+        );
+        assert!(error.contains("cannot pick them up"), "{error}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_fail_when_the_file_on_disk_is_not_a_plist() {
+        let dir = scratch_dir("garbage");
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            None,
+        );
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+        fs::create_dir_all(layout.managed_dir()).unwrap();
+        fs::write(&layout.path, b"{\"inferenceProvider\": \"gateway\"}\n").unwrap();
+
+        let error = verify_managed_settings(&layout, &doc)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("failed to read back"), "{error}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_name_the_managed_dir_in_the_needs_sudo_hint() {
+        let layout = ManagedLayout {
+            path: PathBuf::from(MACOS_MANAGED_PLIST),
+            format: ManagedFormat::MacOsPlist,
+            stale_path: None,
+        };
+
+        let error = managed_write_error(io::Error::from(io::ErrorKind::PermissionDenied), &layout)
+            .to_string();
+
+        assert_eq!(
+            error,
+            "needs sudo (managed dir /Library/Managed Preferences is root-owned)"
+        );
     }
 }

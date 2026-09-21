@@ -2,7 +2,7 @@
 
 Relay wires the Claude Desktop app (third-party gateway mode) onto your LiteLLM AI Gateway so it boots straight into gateway mode with no Claude.ai account and no key handling by the developer.
 
-`relay onboard-claude-desktop` writes the OS-native managed configuration Claude Desktop reads on launch — `/etc/claude-desktop/managed-settings.json` on Linux — pointing inference at the Gateway. The Gateway must implement the Anthropic Messages API (`POST /v1/messages`), which LiteLLM does.
+`relay onboard-claude-desktop` writes the OS-native managed configuration Claude Desktop reads on launch, pointing inference at the Gateway: on macOS the `com.anthropic.claudefordesktop` managed preferences domain (`/Library/Managed Preferences/com.anthropic.claudefordesktop.plist`), on Linux `/etc/claude-desktop/managed-settings.json`. The Gateway must implement the Anthropic Messages API (`POST /v1/messages`), which LiteLLM does.
 
 ## Single sign-on (recommended)
 
@@ -25,7 +25,7 @@ sudo relay onboard-claude-desktop \
   --api-key sk-your-gateway-key
 ```
 
-The managed file must be root-owned (Claude Desktop ignores a user-writable one), so run the command with `sudo`. Restart Claude Desktop to pick up the configuration. Because the managed settings are OS-native, this is the surface you push through your MDM — see [mdm.md](mdm.md).
+The managed location is root-owned, so run the command with `sudo`. Relay reads the file back after writing and fails instead of reporting success when Claude Desktop could not pick it up. On macOS it also deletes the `/etc/claude-desktop/managed-settings.json` that earlier Relay versions wrote there, a file the macOS app never reads. Restart Claude Desktop to pick up the configuration. Because the managed settings are OS-native, this is the surface you push through your MDM — see [mdm.md](mdm.md).
 
 ## Usage
 

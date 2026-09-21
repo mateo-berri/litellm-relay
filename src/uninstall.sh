@@ -90,6 +90,8 @@ PLIST="$HOME/Library/LaunchAgents/ai.litellm.relay.plist"
 AUTOCONFIGURE_PLIST="$HOME/Library/LaunchAgents/ai.litellm.relay.autoconfigure.plist"
 DESKTOP_DAEMON_LABEL="ai.litellm.relay.autoconfigure-desktop"
 DESKTOP_DAEMON_PLIST="/Library/LaunchDaemons/$DESKTOP_DAEMON_LABEL.plist"
+CLAUDE_DESKTOP_MANAGED_PLIST="/Library/Managed Preferences/com.anthropic.claudefordesktop.plist"
+CLAUDE_DESKTOP_STALE_JSON="/etc/claude-desktop/managed-settings.json"
 RELAY_BINARY="$RELAY_HOME/bin/litellm-relay"
 
 if [[ "$(id -u)" -eq 0 ]]; then
@@ -177,6 +179,8 @@ launchctl bootout "gui/$(id -u)" "$AUTOCONFIGURE_PLIST" >/dev/null 2>&1 || true
 rm -f "$AUTOCONFIGURE_PLIST"
 $SUDO launchctl bootout system "$DESKTOP_DAEMON_PLIST" >/dev/null 2>&1 || true
 $SUDO rm -f "$DESKTOP_DAEMON_PLIST" >/dev/null 2>&1 || true
+$SUDO rm -f "$CLAUDE_DESKTOP_MANAGED_PLIST" "$CLAUDE_DESKTOP_STALE_JSON" >/dev/null 2>&1 || true
+$SUDO rmdir "$(dirname "$CLAUDE_DESKTOP_STALE_JSON")" >/dev/null 2>&1 || true
 
 if [[ -n "$NETWORK_SERVICE" ]]; then
   networksetup -setautoproxystate "$NETWORK_SERVICE" off
@@ -206,6 +210,7 @@ Removed:
   LaunchAgent: $PLIST
   LaunchAgent: $AUTOCONFIGURE_PLIST
   LaunchDaemon: $DESKTOP_DAEMON_PLIST
+  Claude Desktop managed settings: $CLAUDE_DESKTOP_MANAGED_PLIST
 DONE
 
 if [[ "$REMOVE_BIN" == "1" ]]; then
