@@ -173,14 +173,28 @@ WARN
   fi
 }
 
+CLAUDE_DESKTOP_REMOVED=""
+remove_claude_desktop_managed_settings() {
+  local provider
+  provider="$(/usr/bin/plutil -extract inferenceProvider raw -o - "$CLAUDE_DESKTOP_MANAGED_PLIST" 2>/dev/null || true)"
+  if [[ "$provider" == "gateway" ]]; then
+    $SUDO rm -f "$CLAUDE_DESKTOP_MANAGED_PLIST" >/dev/null 2>&1 || true
+    CLAUDE_DESKTOP_REMOVED="$CLAUDE_DESKTOP_MANAGED_PLIST"
+  fi
+  if grep -q '"inferenceProvider": "gateway"' "$CLAUDE_DESKTOP_STALE_JSON" 2>/dev/null; then
+    $SUDO rm -f "$CLAUDE_DESKTOP_STALE_JSON" >/dev/null 2>&1 || true
+    $SUDO rmdir "$(dirname "$CLAUDE_DESKTOP_STALE_JSON")" >/dev/null 2>&1 || true
+    CLAUDE_DESKTOP_REMOVED="${CLAUDE_DESKTOP_REMOVED:+$CLAUDE_DESKTOP_REMOVED, }$CLAUDE_DESKTOP_STALE_JSON"
+  fi
+}
+
 launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
 rm -f "$PLIST"
 launchctl bootout "gui/$(id -u)" "$AUTOCONFIGURE_PLIST" >/dev/null 2>&1 || true
 rm -f "$AUTOCONFIGURE_PLIST"
 $SUDO launchctl bootout system "$DESKTOP_DAEMON_PLIST" >/dev/null 2>&1 || true
 $SUDO rm -f "$DESKTOP_DAEMON_PLIST" >/dev/null 2>&1 || true
-$SUDO rm -f "$CLAUDE_DESKTOP_MANAGED_PLIST" "$CLAUDE_DESKTOP_STALE_JSON" >/dev/null 2>&1 || true
-$SUDO rmdir "$(dirname "$CLAUDE_DESKTOP_STALE_JSON")" >/dev/null 2>&1 || true
+remove_claude_desktop_managed_settings
 
 if [[ -n "$NETWORK_SERVICE" ]]; then
   networksetup -setautoproxystate "$NETWORK_SERVICE" off
@@ -210,8 +224,13 @@ Removed:
   LaunchAgent: $PLIST
   LaunchAgent: $AUTOCONFIGURE_PLIST
   LaunchDaemon: $DESKTOP_DAEMON_PLIST
-  Claude Desktop managed settings: $CLAUDE_DESKTOP_MANAGED_PLIST
 DONE
+
+if [[ -n "$CLAUDE_DESKTOP_REMOVED" ]]; then
+  cat <<DONE
+  Claude Desktop managed settings: $CLAUDE_DESKTOP_REMOVED
+DONE
+fi
 
 if [[ "$REMOVE_BIN" == "1" ]]; then
   cat <<DONE

@@ -25,7 +25,9 @@ sudo relay onboard-claude-desktop \
   --api-key sk-your-gateway-key
 ```
 
-The managed location is root-owned, so run the command with `sudo`. Relay reads the file back after writing and fails instead of reporting success when Claude Desktop could not pick it up. On macOS it also deletes the `/etc/claude-desktop/managed-settings.json` that earlier Relay versions wrote there, a file the macOS app never reads. Restart Claude Desktop to pick up the configuration. Because the managed settings are OS-native, this is the surface you push through your MDM — see [mdm.md](mdm.md).
+The managed location is root-owned and Claude Desktop ignores a user-writable copy, so run the command with `sudo`. Relay reads the file back after writing and fails instead of reporting success when Claude Desktop could not pick it up, including when a per-user managed plist (`/Library/Managed Preferences/<account>/com.anthropic.claudefordesktop.plist`, which the app reads over the host-level one) already sets the inference keys. On macOS it also deletes the `/etc/claude-desktop/managed-settings.json` that earlier Relay versions wrote there, a file the macOS app never reads. Restart Claude Desktop to pick up the managed configuration. Because the managed settings are OS-native, this is the surface you push through your MDM, see [mdm.md](mdm.md).
+
+A static key is stored in that file in clear, readable by every local account like any managed preference (the app reads it as the developer). Keep static keys to proofs of concept and use SSO for a rollout.
 
 ## Usage
 

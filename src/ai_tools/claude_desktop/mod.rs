@@ -158,8 +158,6 @@ fn build_managed_settings(settings: &RelaySettings, sso: Option<&SsoConfig>) -> 
     root
 }
 
-/// On-disk encoding of the managed document, which follows the platform Claude
-/// Desktop is built for rather than any path override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedFormat {
     MacOsPlist,
@@ -176,9 +174,6 @@ impl ManagedFormat {
     }
 }
 
-/// Where the managed document lives on this host, how it is encoded, and which
-/// file from an earlier Relay layout must go once the new one is in effect.
-/// `CLAUDE_DESKTOP_MANAGED_SETTINGS` overrides the path only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManagedLayout {
     path: PathBuf,
@@ -188,10 +183,14 @@ struct ManagedLayout {
 
 impl ManagedLayout {
     fn for_host() -> Self {
+        Self::resolve(env::var_os(MANAGED_SETTINGS_PATH_ENV).map(PathBuf::from))
+    }
+
+    fn resolve(path_override: Option<PathBuf>) -> Self {
         let format = ManagedFormat::for_host();
-        if let Some(path) = env::var_os(MANAGED_SETTINGS_PATH_ENV) {
+        if let Some(path) = path_override {
             return Self {
-                path: PathBuf::from(path),
+                path,
                 format,
                 stale_path: None,
             };
@@ -215,6 +214,7 @@ impl ManagedLayout {
     }
 }
 
+#[derive(Debug)]
 struct ManagedWrite {
     path: PathBuf,
     removed_stale: Option<PathBuf>,
@@ -224,10 +224,23 @@ fn write_managed_settings(
     layout: &ManagedLayout,
     document: &Map<String, Value>,
 ) -> Result<ManagedWrite> {
-    fs::create_dir_all(layout.managed_dir()).map_err(|error| managed_write_error(error, layout))?;
-    let rendered = render_managed_settings(layout.format, document)?;
-    fs::write(&layout.path, rendered).map_err(|error| managed_write_error(error, layout))?;
-    verify_managed_settings(layout, document)?;
+    if let Some(per_user) = find_per_user_override(layout, document) {
+        bail!(
+            "per-user managed plist {} sets {}, and Claude Desktop reads it over {}",
+            per_user.path.display(),
+            per_user.keys.join(", "),
+            layout.path.display()
+        );
+    }
+
+    if verify_managed_settings(layout, document).is_err() {
+        fs::create_dir_all(layout.managed_dir())
+            .map_err(|error| managed_write_error(error, layout))?;
+        let rendered = render_managed_settings(layout.format, document)?;
+        replace_atomically(&layout.path, &rendered)
+            .map_err(|error| managed_write_error(error, layout))?;
+        verify_managed_settings(layout, document)?;
+    }
 
     let removed_stale = match &layout.stale_path {
         Some(stale) => remove_stale_managed_file(stale)?,
@@ -236,6 +249,43 @@ fn write_managed_settings(
     Ok(ManagedWrite {
         path: layout.path.clone(),
         removed_stale,
+    })
+}
+
+struct PerUserOverride {
+    path: PathBuf,
+    keys: Vec<String>,
+}
+
+fn find_per_user_override(
+    layout: &ManagedLayout,
+    document: &Map<String, Value>,
+) -> Option<PerUserOverride> {
+    if layout.format != ManagedFormat::MacOsPlist {
+        return None;
+    }
+    let file_name = layout.path.file_name()?;
+    fs::read_dir(layout.managed_dir())
+        .ok()?
+        .flatten()
+        .map(|account_dir| account_dir.path().join(file_name))
+        .find_map(|path| {
+            let per_user: plist::Value = plist::from_file(&path).ok()?;
+            let keys: Vec<String> = per_user
+                .as_dictionary()?
+                .keys()
+                .filter(|key| document.contains_key(*key))
+                .cloned()
+                .collect();
+            (!keys.is_empty()).then_some(PerUserOverride { path, keys })
+        })
+}
+
+fn replace_atomically(path: &Path, rendered: &[u8]) -> io::Result<()> {
+    let staged = path.with_extension("relay-tmp");
+    fs::write(&staged, rendered)?;
+    fs::rename(&staged, path).inspect_err(|_| {
+        let _ = fs::remove_file(&staged);
     })
 }
 
@@ -257,9 +307,6 @@ fn render_managed_settings(
     }
 }
 
-/// Reads the managed file back the way Claude Desktop will and fails when it
-/// does not contain exactly the document just written, so a write that cannot
-/// take effect never reports success.
 fn verify_managed_settings(layout: &ManagedLayout, document: &Map<String, Value>) -> Result<()> {
     let matches = match layout.format {
         ManagedFormat::MacOsPlist => {
@@ -285,17 +332,24 @@ fn verify_managed_settings(layout: &ManagedLayout, document: &Map<String, Value>
 }
 
 fn remove_stale_managed_file(stale: &Path) -> Result<Option<PathBuf>> {
-    match fs::remove_file(stale) {
-        Ok(()) => {
-            remove_dir_if_empty(stale.parent());
-            Ok(Some(stale.to_path_buf()))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(anyhow::Error::new(error).context(format!(
+    if !holds_gateway_settings(stale) {
+        return Ok(None);
+    }
+    fs::remove_file(stale).with_context(|| {
+        format!(
             "failed to remove the stale {} (it holds the Gateway credential and Claude Desktop never reads it here)",
             stale.display()
-        ))),
-    }
+        )
+    })?;
+    remove_dir_if_empty(stale.parent());
+    Ok(Some(stale.to_path_buf()))
+}
+
+fn holds_gateway_settings(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|contents| serde_json::from_slice::<Value>(&contents).ok())
+        .is_some_and(|settings| settings["inferenceProvider"] == "gateway")
 }
 
 fn remove_dir_if_empty(dir: Option<&Path>) {
@@ -411,13 +465,16 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn should_target_the_managed_preferences_plist_on_macos() {
-        let layout = ManagedLayout::for_host();
+        let layout = ManagedLayout::resolve(None);
 
-        assert_eq!(layout.path, PathBuf::from(MACOS_MANAGED_PLIST));
+        assert_eq!(
+            layout.path,
+            PathBuf::from("/Library/Managed Preferences/com.anthropic.claudefordesktop.plist")
+        );
         assert_eq!(layout.format, ManagedFormat::MacOsPlist);
         assert_eq!(
             layout.stale_path.as_deref(),
-            Some(Path::new(LINUX_MANAGED_JSON)),
+            Some(Path::new("/etc/claude-desktop/managed-settings.json")),
             "the /etc file earlier Relay versions wrote on macOS must be cleaned up"
         );
     }
@@ -425,11 +482,26 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn should_target_the_etc_json_file_on_linux() {
-        let layout = ManagedLayout::for_host();
+        let layout = ManagedLayout::resolve(None);
 
-        assert_eq!(layout.path, PathBuf::from(LINUX_MANAGED_JSON));
+        assert_eq!(
+            layout.path,
+            PathBuf::from("/etc/claude-desktop/managed-settings.json")
+        );
         assert_eq!(layout.format, ManagedFormat::LinuxJson);
         assert_eq!(layout.stale_path, None);
+    }
+
+    #[test]
+    fn should_honor_the_path_override_and_skip_the_stale_cleanup() {
+        let layout = ManagedLayout::resolve(Some(PathBuf::from("/tmp/relay/managed.plist")));
+
+        assert_eq!(layout.path, PathBuf::from("/tmp/relay/managed.plist"));
+        assert_eq!(layout.format, ManagedFormat::for_host());
+        assert_eq!(
+            layout.stale_path, None,
+            "a custom layout must never delete the real /etc file"
+        );
     }
 
     #[test]
@@ -509,7 +581,11 @@ mod tests {
             .join("claude-desktop")
             .join("managed-settings.json");
         fs::create_dir_all(stale.parent().unwrap()).unwrap();
-        fs::write(&stale, "{\"inferenceGatewayApiKey\": \"sk-old\"}\n").unwrap();
+        fs::write(
+            &stale,
+            "{\"inferenceProvider\": \"gateway\", \"inferenceGatewayApiKey\": \"sk-old\"}\n",
+        )
+        .unwrap();
         let layout = layout_in(
             &dir,
             "com.anthropic.claudefordesktop.plist",
@@ -550,6 +626,161 @@ mod tests {
         let written = write_managed_settings(&layout, &doc).unwrap();
 
         assert_eq!(written.removed_stale, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_leave_a_stale_path_alone_when_it_is_not_a_gateway_config() {
+        let dir = scratch_dir("foreign-stale");
+        let stale = dir
+            .join("etc")
+            .join("claude-desktop")
+            .join("managed-settings.json");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, "{\"inferenceProvider\": \"anthropic\"}\n").unwrap();
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            Some(stale.clone()),
+        );
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+
+        let written = write_managed_settings(&layout, &doc).unwrap();
+
+        assert_eq!(written.removed_stale, None);
+        assert!(stale.exists(), "a file Relay did not write must survive");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_fail_before_writing_when_a_per_user_plist_overrides_the_gateway_keys() {
+        let dir = scratch_dir("per-user");
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            None,
+        );
+        let per_user = dir
+            .join("managed")
+            .join("alice")
+            .join("com.anthropic.claudefordesktop.plist");
+        fs::create_dir_all(per_user.parent().unwrap()).unwrap();
+        let mdm_settings = build_managed_settings(
+            &settings_with("https://mdm.corp", Some("sk-mdm"), "claude-sonnet-5"),
+            None,
+        );
+        fs::write(
+            &per_user,
+            render_managed_settings(ManagedFormat::MacOsPlist, &mdm_settings).unwrap(),
+        )
+        .unwrap();
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+
+        let error = write_managed_settings(&layout, &doc)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("alice/com.anthropic.claudefordesktop.plist"),
+            "{error}"
+        );
+        assert!(error.contains("inferenceGatewayBaseUrl"), "{error}");
+        assert!(
+            !layout.path.exists(),
+            "nothing may be written when the settings cannot take effect"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_write_when_a_per_user_plist_sets_unrelated_keys_only() {
+        let dir = scratch_dir("per-user-unrelated");
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            None,
+        );
+        let per_user = dir
+            .join("managed")
+            .join("alice")
+            .join("com.anthropic.claudefordesktop.plist");
+        fs::create_dir_all(per_user.parent().unwrap()).unwrap();
+        let mut unrelated = Map::new();
+        unrelated.insert("mcpEnabled".into(), Value::Bool(false));
+        fs::write(
+            &per_user,
+            render_managed_settings(ManagedFormat::MacOsPlist, &unrelated).unwrap(),
+        )
+        .unwrap();
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+
+        write_managed_settings(&layout, &doc).unwrap();
+
+        assert!(layout.path.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_replace_a_different_file_and_leave_no_staging_file_behind() {
+        let dir = scratch_dir("replace");
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            None,
+        );
+        fs::create_dir_all(layout.managed_dir()).unwrap();
+        fs::write(&layout.path, b"not a plist").unwrap();
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+
+        write_managed_settings(&layout, &doc).unwrap();
+
+        let on_disk: plist::Value = plist::from_file(&layout.path).unwrap();
+        assert_eq!(on_disk, plist::to_value(&doc).unwrap());
+        let leftovers: Vec<_> = fs::read_dir(layout.managed_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec![std::ffi::OsString::from(
+                "com.anthropic.claudefordesktop.plist"
+            )]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_not_rewrite_a_file_that_already_holds_the_document() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = scratch_dir("steady");
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            None,
+        );
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+        write_managed_settings(&layout, &doc).unwrap();
+        let first_inode = fs::metadata(&layout.path).unwrap().ino();
+
+        write_managed_settings(&layout, &doc).unwrap();
+
+        assert_eq!(
+            fs::metadata(&layout.path).unwrap().ino(),
+            first_inode,
+            "an hourly re-run must not churn a file that is already current"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
