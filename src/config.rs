@@ -177,6 +177,8 @@ pub struct ClaudeSection {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_sso: Option<DesktopSso>,
 }
 
 impl Default for ClaudeSection {
@@ -184,8 +186,21 @@ impl Default for ClaudeSection {
         Self {
             model: "claude-sonnet-4-5".into(),
             team: None,
+            desktop_sso: None,
         }
     }
+}
+
+/// OIDC settings Claude Desktop was enrolled with, kept so unattended
+/// autoconfigure reruns can rebuild the same single sign-on document.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct DesktopSso {
+    pub client_id: String,
+    pub issuer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
