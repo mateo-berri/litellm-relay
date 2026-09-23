@@ -43,6 +43,10 @@ pub struct AutoConfigureParams {
     pub oidc_issuer: Option<String>,
     pub oidc_scopes: Option<String>,
     pub oidc_redirect_port: Option<u16>,
+    /// Set by `autoconfigure` when `--api-key` was passed on the command line,
+    /// so a key filled in by the saved-credential fallback does not read as an
+    /// explicit static-key run.
+    pub explicit_api_key: bool,
 }
 
 /// Whether the Gateway still accepts the static credential about to be written into tool configs.
@@ -64,6 +68,7 @@ pub enum CredentialGate {
 /// lets the root-owned periodic agent handle just Claude Desktop (its managed
 /// file lives under `/etc`) while the per-user agent handles the rest.
 pub async fn autoconfigure(mut params: AutoConfigureParams, only: &[AiTool]) -> Result<()> {
+    params.explicit_api_key = params.api_key.is_some();
     apply_credential_fallback(&mut params)?;
     let gate_params = params.clone();
     autoconfigure_with(
@@ -324,8 +329,17 @@ fn configure_tool(tool: AiTool, params: &AutoConfigureParams) -> Result<()> {
             oidc_scopes: params.oidc_scopes.clone(),
             oidc_redirect_port: params.oidc_redirect_port,
             quiet: true,
+            reuse_saved_sso: desktop_reuse_saved_sso(params),
         }),
     }
+}
+
+/// Whether a Claude Desktop pass may reuse the saved SSO settings. An explicit
+/// `--api-key` is a human asking for a static key, which clears the saved SSO
+/// like `onboard-claude-desktop --api-key` does; a key filled by the
+/// saved-credential fallback keeps it.
+fn desktop_reuse_saved_sso(params: &AutoConfigureParams) -> bool {
+    !params.explicit_api_key
 }
 
 #[cfg(test)]
@@ -511,6 +525,25 @@ mod tests {
 
         assert!(result.is_err());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn should_reuse_saved_sso_when_the_key_came_from_the_saved_config() {
+        let params = AutoConfigureParams {
+            api_key: Some("sk-saved".to_string()),
+            ..Default::default()
+        };
+        assert!(desktop_reuse_saved_sso(&params));
+    }
+
+    #[test]
+    fn should_drop_saved_sso_on_an_explicit_api_key() {
+        let params = AutoConfigureParams {
+            api_key: Some("sk-flag".to_string()),
+            explicit_api_key: true,
+            ..Default::default()
+        };
+        assert!(!desktop_reuse_saved_sso(&params));
     }
 
     #[tokio::test]
