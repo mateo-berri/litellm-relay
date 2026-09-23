@@ -126,7 +126,9 @@ supports it.
 
 The per-user LaunchAgent re-runs `autoconfigure` at login and on its interval.
 Each run checks the stored Gateway credential first. If the Gateway rejects it,
-the run leaves the Codex and Claude Code configs untouched and exits non-zero,
-so an expired SSO session shows up in the LaunchAgent's exit status and in the
-`credential` block of `/api/status` instead of being rewritten into the tools
-every hour
+the run leaves the Codex, Claude Code, and Claude Desktop configs untouched and
+exits non-zero, so an expired SSO session shows up in the LaunchAgent's exit
+status and in the `credential` block of `/api/status` instead of being rewritten
+into the tools every hour. The check also covers the saved key Claude Desktop
+falls back to when it is not given OIDC flags, so an IdP setup cannot copy a
+rejected key into the desktop app

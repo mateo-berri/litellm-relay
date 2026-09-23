@@ -65,12 +65,12 @@ pub enum CredentialGate {
 /// file lives under `/etc`) while the per-user agent handles the rest.
 pub async fn autoconfigure(mut params: AutoConfigureParams, only: &[AiTool]) -> Result<()> {
     apply_credential_fallback(&mut params)?;
-    let gate = credential_gate(params.clone());
+    let gate_params = params.clone();
     autoconfigure_with(
         &DetectContext::from_env(),
         params,
         only,
-        gate,
+        move |tools: &[AiTool]| credential_gate(gate_params.clone(), tools.to_vec()),
         &mut configure_tool,
     )
     .await
@@ -94,20 +94,47 @@ fn apply_credential_fallback(params: &mut AutoConfigureParams) -> Result<()> {
     Ok(())
 }
 
+/// The static Gateway key this pass would write into some tool config, if any.
+/// Claude Desktop falls back to the saved key whenever it is not given OIDC
+/// flags, even on IdP setups, so that key is gated too.
+fn static_key_in_play(
+    params: &AutoConfigureParams,
+    saved_key: Option<&str>,
+    tools: &[AiTool],
+) -> Option<String> {
+    let desktop_static = tools.contains(&AiTool::ClaudeDesktop)
+        && params.oidc_client_id.is_none()
+        && params.oidc_issuer.is_none();
+    if params.authorize_url.is_none() {
+        if let Some(key) = &params.api_key {
+            return Some(key.clone());
+        }
+    }
+    if desktop_static {
+        return params.api_key.clone().or_else(|| {
+            saved_key
+                .filter(|key| !key.trim().is_empty())
+                .map(str::to_string)
+        });
+    }
+    None
+}
+
 /// Verify the static key against the Gateway before it lands in any tool config.
-async fn credential_gate(params: AutoConfigureParams) -> Result<CredentialGate> {
-    let Some(api_key) = &params.api_key else {
+async fn credential_gate(
+    params: AutoConfigureParams,
+    tools: Vec<AiTool>,
+) -> Result<CredentialGate> {
+    let settings = load_settings()?;
+    let Some(api_key) = static_key_in_play(&params, settings.gateway.api_key.as_deref(), &tools)
+    else {
         return Ok(CredentialGate::NotStatic);
     };
-    if params.authorize_url.is_some() {
-        return Ok(CredentialGate::NotStatic);
-    }
-    let settings = load_settings()?;
     let gateway_url = params
         .gateway_url
         .clone()
         .unwrap_or_else(|| settings.gateway.url.clone());
-    let gate = match check_credential(&check_client(), &gateway_url, api_key).await {
+    let gate = match check_credential(&check_client(), &gateway_url, &api_key).await {
         CredentialCheck::Valid => {
             let expires_at = settings
                 .gateway
@@ -138,13 +165,16 @@ struct Configured {
 /// writing real tool config files or talking to a Gateway. The gate is only
 /// awaited once a tool is detected, so a device with nothing to configure
 /// never talks to the Gateway.
-async fn autoconfigure_with(
+async fn autoconfigure_with<Fut>(
     ctx: &DetectContext,
     params: AutoConfigureParams,
     only: &[AiTool],
-    gate: impl Future<Output = Result<CredentialGate>>,
+    gate: impl FnOnce(&[AiTool]) -> Fut,
     configure: &mut dyn FnMut(AiTool, &AutoConfigureParams) -> Result<()>,
-) -> Result<()> {
+) -> Result<()>
+where
+    Fut: Future<Output = Result<CredentialGate>>,
+{
     let mut detected = detect_all(ctx);
     if !only.is_empty() {
         detected.retain(|detection| only.contains(&detection.tool));
@@ -164,7 +194,8 @@ async fn autoconfigure_with(
     );
     println!();
 
-    match gate.await? {
+    let tools: Vec<AiTool> = detected.iter().map(|d| d.tool).collect();
+    match gate(&tools).await? {
         CredentialGate::Restricted { detail } => {
             println!(
                 "  {}  The Gateway accepts the stored credential but does not allow it on \
@@ -299,6 +330,7 @@ mod tests {
         cell::Cell,
         env, fs,
         path::{Path, PathBuf},
+        pin::Pin,
     };
 
     fn temp_home(tag: &str) -> PathBuf {
@@ -323,15 +355,17 @@ mod tests {
         }
     }
 
-    async fn gate(gate: CredentialGate) -> Result<CredentialGate> {
-        Ok(gate)
+    fn gate(
+        value: CredentialGate,
+    ) -> impl FnOnce(&[AiTool]) -> Pin<Box<dyn Future<Output = Result<CredentialGate>>>> {
+        move |_tools: &[AiTool]| Box::pin(async move { Ok(value) })
     }
 
     #[tokio::test]
     async fn should_not_consult_the_gateway_when_no_tool_is_detected() {
         let home = temp_home("no-probe");
         let probed = Cell::new(false);
-        let gate = async {
+        let gate = |_tools: &[AiTool]| async {
             probed.set(true);
             Ok(CredentialGate::Rejected {
                 detail: "must never be asked".into(),
@@ -542,6 +576,66 @@ mod tests {
         );
         assert_eq!(attempted, 0, "no tool config may be written");
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn static_key_in_play_covers_the_desktop_saved_key_fallback() {
+        let idp_params = AutoConfigureParams {
+            authorize_url: Some("https://idp.example.com/authorize".into()),
+            ..AutoConfigureParams::default()
+        };
+        assert_eq!(
+            static_key_in_play(&idp_params, Some("sk-saved"), &[AiTool::ClaudeDesktop]),
+            Some("sk-saved".to_string()),
+            "the saved key Claude Desktop falls back to must be gated on IdP setups"
+        );
+        assert_eq!(
+            static_key_in_play(&idp_params, Some("sk-saved"), &[AiTool::ClaudeCode]),
+            None,
+            "no static key reaches Claude Code on an IdP setup"
+        );
+
+        let oidc_params = AutoConfigureParams {
+            authorize_url: Some("https://idp.example.com/authorize".into()),
+            oidc_client_id: Some("client".into()),
+            oidc_issuer: Some("https://issuer.example.com".into()),
+            ..AutoConfigureParams::default()
+        };
+        assert_eq!(
+            static_key_in_play(&oidc_params, Some("sk-saved"), &[AiTool::ClaudeDesktop]),
+            None,
+            "Claude Desktop given OIDC flags never touches the saved key"
+        );
+
+        assert_eq!(
+            static_key_in_play(&static_key_params(), Some("sk-saved"), &[AiTool::Codex]),
+            Some("sk-static".to_string()),
+            "an explicit static key is in play without an authorize URL"
+        );
+
+        let flag_and_idp = AutoConfigureParams {
+            api_key: Some("sk-flag".into()),
+            ..idp_params.clone()
+        };
+        assert_eq!(
+            static_key_in_play(
+                &flag_and_idp,
+                Some("sk-saved"),
+                &[AiTool::ClaudeDesktop, AiTool::ClaudeCode]
+            ),
+            Some("sk-flag".to_string()),
+            "on an IdP setup the explicit key still reaches Claude Desktop"
+        );
+
+        assert_eq!(
+            static_key_in_play(
+                &AutoConfigureParams::default(),
+                Some("  "),
+                &[AiTool::ClaudeDesktop]
+            ),
+            None,
+            "a blank saved key is not a credential"
+        );
     }
 
     #[tokio::test]
