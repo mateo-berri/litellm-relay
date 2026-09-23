@@ -131,4 +131,6 @@ exits non-zero, so an expired SSO session shows up in the LaunchAgent's exit
 status and in the `credential` block of `/api/status` instead of being rewritten
 into the tools every hour. The check also covers the saved key Claude Desktop
 falls back to when it is not given OIDC flags, so an IdP setup cannot copy a
-rejected key into the desktop app
+rejected key into the desktop app. `/api/status` reflects the credential
+currently saved in `config.yaml`, so re-running `litellm-relay setup` updates
+the dashboard without restarting Relay

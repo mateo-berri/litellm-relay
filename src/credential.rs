@@ -128,11 +128,51 @@ pub(crate) mod test_support {
         base_url
     }
 
-    /// Accept one connection and hold it open without answering until `release` fires.
-    pub(crate) async fn serve_hung_until(release: tokio::sync::oneshot::Receiver<()>) -> String {
+    /// Serve each (status line, body) pair to one connection in order and
+    /// return the base URL to reach it.
+    pub(crate) async fn serve_sequence(responses: &[(&str, &str)]) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let responses: Vec<String> = responses
+            .iter()
+            .map(|(status_line, body)| {
+                format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            })
+            .collect();
         tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        base_url
+    }
+
+    /// Answer the first connection, then hold the second open without answering
+    /// until `release` fires.
+    pub(crate) async fn serve_once_then_hung(
+        status_line: &str,
+        body: &str,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
             let (stream, _) = listener.accept().await.unwrap();
             let _ = release.await;
             drop(stream);
