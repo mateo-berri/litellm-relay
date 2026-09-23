@@ -243,17 +243,18 @@ fn write_managed_settings(
     if verify_managed_settings(layout, document).is_err() {
         let managed_dir = layout.managed_dir();
         let dir_missing = !managed_dir.exists();
-        fs::create_dir_all(managed_dir).map_err(|error| managed_write_error(error, layout))?;
+        fs::create_dir_all(managed_dir)
+            .map_err(|error| managed_write_error(error, layout, managed_dir))?;
         pin_managed_dir_mode(managed_dir, dir_missing)
-            .map_err(|error| managed_write_error(error, layout))?;
+            .map_err(|error| managed_write_error(error, layout, managed_dir))?;
         let rendered = render_managed_settings(layout.format, document)?;
         replace_atomically(&layout.path, &rendered)
-            .map_err(|error| managed_write_error(error, layout))?;
+            .map_err(|error| managed_write_error(error, layout, &layout.path))?;
         verify_managed_settings(layout, document)?;
     }
 
     let removed_stale = match &layout.stale_path {
-        Some(stale) => remove_stale_managed_file(stale)?,
+        Some(stale) => remove_stale_managed_file(stale, layout)?,
         None => None,
     };
     Ok(ManagedWrite {
@@ -371,16 +372,11 @@ fn verify_managed_settings(layout: &ManagedLayout, document: &Map<String, Value>
     Ok(())
 }
 
-fn remove_stale_managed_file(stale: &Path) -> Result<Option<PathBuf>> {
+fn remove_stale_managed_file(stale: &Path, layout: &ManagedLayout) -> Result<Option<PathBuf>> {
     if !holds_gateway_settings(stale) {
         return Ok(None);
     }
-    fs::remove_file(stale).with_context(|| {
-        format!(
-            "failed to remove the stale {} (it holds the Gateway credential and Claude Desktop never reads it here)",
-            stale.display()
-        )
-    })?;
+    fs::remove_file(stale).map_err(|error| managed_write_error(error, layout, stale))?;
     remove_dir_if_empty(stale.parent());
     Ok(Some(stale.to_path_buf()))
 }
@@ -402,14 +398,14 @@ fn remove_dir_if_empty(dir: Option<&Path>) {
 /// message. Permission errors get a short "needs sudo" hint (surfaced verbatim
 /// in the autoconfigure summary) instead of the raw
 /// "Permission denied (os error 13)".
-fn managed_write_error(error: io::Error, layout: &ManagedLayout) -> anyhow::Error {
+fn managed_write_error(error: io::Error, layout: &ManagedLayout, path: &Path) -> anyhow::Error {
     if error.kind() == io::ErrorKind::PermissionDenied {
         anyhow!(
             "needs sudo (managed dir {} is root-owned)",
             layout.managed_dir().display()
         )
     } else {
-        anyhow::Error::new(error).context(format!("failed to write {}", layout.path.display()))
+        anyhow::Error::new(error).context(format!("failed to write {}", path.display()))
     }
 }
 
@@ -926,8 +922,12 @@ mod tests {
             stale_path: None,
         };
 
-        let error = managed_write_error(io::Error::from(io::ErrorKind::PermissionDenied), &layout)
-            .to_string();
+        let error = managed_write_error(
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            &layout,
+            &layout.path,
+        )
+        .to_string();
 
         assert_eq!(
             error,

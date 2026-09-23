@@ -185,6 +185,7 @@ async fn run_command(command: CommandKind) -> Result<()> {
                     oidc_issuer,
                     oidc_scopes,
                     oidc_redirect_port,
+                    explicit_api_key: false,
                 },
                 &only,
             )
