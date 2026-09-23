@@ -70,10 +70,11 @@ authenticates but answers 403 for (its `allowed_routes` or `key_type` leaves out
 `/v1/models`) is still written, with a warning that quotes the Gateway. The
 check only runs once a supported tool is detected. When the Gateway reported an
 expiry at sign-in, the run also warns once the credential is within 24 hours of
-it. The same check is exposed on `/api/status` as a `credential` block (`state`
-is `valid`, `restricted`, `rejected`, `unverifiable`, or `missing`; `expiry` is
-`unknown`, `ok`, `expiring_soon`, or `expired`; plus `detail`, `checked_at`,
-`enrolled_at`, and `expires_at`), and the dashboard shows it as the
+it. The same check is exposed on `/api/status` as a `credential` block
+(`configured` says whether a Gateway key is saved; `state` is `valid`,
+`restricted`, `rejected`, `unverifiable`, or `missing`; `expiry` is `unknown`,
+`ok`, `expiring_soon`, or `expired`; plus `detail`, `checked_at`, `enrolled_at`,
+and `expires_at`), and the dashboard shows it as the
 `Gateway credential` row. The status endpoint serves the last check for up to
 60 seconds and refreshes it in the background, so only the first call after
 `serve` starts waits on the Gateway (at most 10 seconds)

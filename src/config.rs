@@ -120,6 +120,14 @@ impl Default for GatewaySection {
     }
 }
 
+impl GatewaySection {
+    pub fn enroll(&mut self, api_key: String, expires_at: Option<DateTime<Utc>>) {
+        self.api_key = Some(api_key);
+        self.enrolled_at = Some(Utc::now());
+        self.expires_at = expires_at;
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ShadowSection {
@@ -462,6 +470,26 @@ gateway:
         assert_eq!(reloaded.gateway.enrolled_at, Some(enrolled_at));
         assert_eq!(reloaded.gateway.expires_at, Some(expires_at));
         assert_eq!(reloaded.to_config().gateway_expires_at, Some(expires_at));
+    }
+
+    #[test]
+    fn should_stamp_enrollment_when_a_new_key_replaces_the_saved_one() {
+        let stale = DateTime::parse_from_rfc3339("2026-09-21T21:27:58Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut gateway = GatewaySection {
+            api_key: Some("sk-old".into()),
+            enrolled_at: Some(stale),
+            expires_at: Some(stale),
+            ..GatewaySection::default()
+        };
+        let before = Utc::now();
+
+        gateway.enroll("sk-new".into(), None);
+
+        assert_eq!(gateway.api_key.as_deref(), Some("sk-new"));
+        assert!(gateway.enrolled_at.is_some_and(|at| at >= before));
+        assert_eq!(gateway.expires_at, None);
     }
 
     #[test]

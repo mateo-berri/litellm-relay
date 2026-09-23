@@ -53,7 +53,7 @@ pub fn onboard_desktop(params: OnboardDesktopParams) -> Result<()> {
         settings.gateway.url = gateway_url.trim_end_matches('/').to_string();
     }
     if let Some(api_key) = params.api_key {
-        settings.gateway.api_key = Some(api_key);
+        settings.gateway.enroll(api_key, None);
     }
     if let Some(model) = params.model {
         settings.claude.model = model;

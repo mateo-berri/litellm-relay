@@ -1,7 +1,6 @@
 use std::io::{self, Write};
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 
 use crate::{
     ai_tools::{autoconfigure, AutoConfigureParams},
@@ -45,9 +44,9 @@ pub async fn run_setup(gateway_url: Option<String>, api_key: Option<String>) -> 
     println!();
     print_step(3, 4, "Save local Relay config");
     settings.gateway.url = gateway_url.trim_end_matches('/').to_string();
-    settings.gateway.api_key = Some(api_key.trim().to_string());
-    settings.gateway.enrolled_at = Some(Utc::now());
-    settings.gateway.expires_at = expires_at;
+    settings
+        .gateway
+        .enroll(api_key.trim().to_string(), expires_at);
     let config_path = save_settings(&settings)?;
     print_setup_complete(
         &config_path,
