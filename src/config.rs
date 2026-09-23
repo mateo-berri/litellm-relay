@@ -126,6 +126,13 @@ impl GatewaySection {
         self.enrolled_at = Some(Utc::now());
         self.expires_at = expires_at;
     }
+
+    pub fn enroll_if_changed(&mut self, api_key: String) {
+        if self.api_key.as_deref() == Some(api_key.as_str()) {
+            return;
+        }
+        self.enroll(api_key, None);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -489,6 +496,33 @@ gateway:
 
         assert_eq!(gateway.api_key.as_deref(), Some("sk-new"));
         assert!(gateway.enrolled_at.is_some_and(|at| at >= before));
+        assert_eq!(gateway.expires_at, None);
+    }
+
+    #[test]
+    fn should_keep_enrollment_timestamps_when_the_saved_key_is_handed_back() {
+        let enrolled_at = DateTime::parse_from_rfc3339("2026-09-21T21:27:58Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let expires_at = DateTime::parse_from_rfc3339("2026-09-22T21:27:58Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut gateway = GatewaySection {
+            api_key: Some("sk-saved".into()),
+            enrolled_at: Some(enrolled_at),
+            expires_at: Some(expires_at),
+            ..GatewaySection::default()
+        };
+
+        gateway.enroll_if_changed("sk-saved".into());
+
+        assert_eq!(gateway.enrolled_at, Some(enrolled_at));
+        assert_eq!(gateway.expires_at, Some(expires_at));
+
+        gateway.enroll_if_changed("sk-new".into());
+
+        assert_eq!(gateway.api_key.as_deref(), Some("sk-new"));
+        assert!(gateway.enrolled_at.is_some_and(|at| at > enrolled_at));
         assert_eq!(gateway.expires_at, None);
     }
 
