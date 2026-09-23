@@ -122,7 +122,9 @@ profile.
 
 Using `--api-key` (or `gateway.api_key` in the managed config) writes a static
 Gateway key to every device. Prefer per-user browser SSO where your Gateway
-supports it.
+supports it. The credential check also runs when `--api-key` is combined with
+`--authorize-url`, since Codex and Claude Code prefer the explicit key over the
+IdP.
 
 The per-user LaunchAgent re-runs `autoconfigure` at login and on its interval.
 Each run checks the stored Gateway credential first. If the Gateway rejects it,

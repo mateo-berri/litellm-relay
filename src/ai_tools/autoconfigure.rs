@@ -95,8 +95,9 @@ fn apply_credential_fallback(params: &mut AutoConfigureParams) -> Result<()> {
 }
 
 /// The static Gateway key this pass would write into some tool config, if any.
-/// Claude Desktop falls back to the saved key whenever it is not given OIDC
-/// flags, even on IdP setups, so that key is gated too.
+/// An explicit --api-key is gated whenever any detected tool would write it:
+/// Codex and Claude Code prefer it over the IdP, and Claude Desktop falls back
+/// to the saved key whenever it is not given OIDC flags, even on IdP setups.
 fn static_key_in_play(
     params: &AutoConfigureParams,
     saved_key: Option<&str>,
@@ -105,17 +106,23 @@ fn static_key_in_play(
     let desktop_static = tools.contains(&AiTool::ClaudeDesktop)
         && params.oidc_client_id.is_none()
         && params.oidc_issuer.is_none();
-    if params.authorize_url.is_none() {
-        if let Some(key) = &params.api_key {
-            return Some(key.clone());
+    let explicit_key_lands = desktop_static
+        || tools
+            .iter()
+            .any(|tool| matches!(tool, AiTool::ClaudeCode | AiTool::Codex));
+    let explicit = params
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty());
+    if explicit_key_lands {
+        if let Some(key) = explicit {
+            return Some(key.to_string());
         }
     }
     if desktop_static {
-        return params.api_key.clone().or_else(|| {
-            saved_key
-                .filter(|key| !key.trim().is_empty())
-                .map(str::to_string)
-        });
+        return saved_key
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_string);
     }
     None
 }
@@ -625,6 +632,43 @@ mod tests {
             ),
             Some("sk-flag".to_string()),
             "on an IdP setup the explicit key still reaches Claude Desktop"
+        );
+        assert_eq!(
+            static_key_in_play(&flag_and_idp, Some("sk-saved"), &[AiTool::Codex]),
+            Some("sk-flag".to_string()),
+            "an explicit key with an authorize URL still lands in Codex"
+        );
+        assert_eq!(
+            static_key_in_play(&flag_and_idp, Some("sk-saved"), &[AiTool::ClaudeCode]),
+            Some("sk-flag".to_string()),
+            "an explicit key with an authorize URL still lands in Claude Code"
+        );
+
+        let oidc_params_with_key = AutoConfigureParams {
+            api_key: Some("sk-flag".into()),
+            ..oidc_params.clone()
+        };
+        assert_eq!(
+            static_key_in_play(
+                &oidc_params_with_key,
+                Some("sk-saved"),
+                &[AiTool::ClaudeDesktop]
+            ),
+            None,
+            "Claude Desktop on OIDC writes no static key, so nothing is gated"
+        );
+
+        assert_eq!(
+            static_key_in_play(
+                &AutoConfigureParams {
+                    api_key: Some("   ".into()),
+                    ..AutoConfigureParams::default()
+                },
+                None,
+                &[AiTool::Codex]
+            ),
+            None,
+            "a blank explicit key is not a credential"
         );
 
         assert_eq!(
