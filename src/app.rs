@@ -220,6 +220,7 @@ async fn run_command(command: CommandKind) -> Result<()> {
             oidc_scopes,
             oidc_redirect_port,
             quiet: false,
+            reuse_saved_sso: false,
         }),
         CommandKind::ClaudeToken => print_token(),
         CommandKind::OnboardCodex {

@@ -194,6 +194,7 @@ fn configure_tool(tool: AiTool, params: &AutoConfigureParams) -> Result<()> {
             oidc_scopes: params.oidc_scopes.clone(),
             oidc_redirect_port: params.oidc_redirect_port,
             quiet: true,
+            reuse_saved_sso: true,
         }),
     }
 }

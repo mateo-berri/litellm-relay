@@ -6,7 +6,7 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::config::{load_settings, save_settings, RelaySettings};
+use crate::config::{load_settings, save_settings, DesktopSso, RelaySettings};
 
 const MANAGED_SETTINGS_PATH_ENV: &str = "CLAUDE_DESKTOP_MANAGED_SETTINGS";
 const MACOS_MANAGED_PLIST: &str =
@@ -34,6 +34,11 @@ pub struct OnboardDesktopParams {
     /// Suppress success output (used by autoconfigure, which prints its own
     /// summary). Standalone `relay onboard-claude-desktop` leaves this false.
     pub quiet: bool,
+    /// Reuse the OIDC settings saved by an earlier onboard when no OIDC flags
+    /// are passed. Autoconfigure sets this so unattended reruns keep whatever
+    /// sign-in mode the device was enrolled with; the standalone command
+    /// leaves it false so its flags decide.
+    pub reuse_saved_sso: bool,
 }
 
 /// Writes the managed configuration Claude Desktop reads on launch so it routes
@@ -55,15 +60,17 @@ pub fn onboard_desktop(params: OnboardDesktopParams) -> Result<()> {
     }
 
     let sso = match (&params.oidc_client_id, &params.oidc_issuer) {
-        (Some(client_id), Some(issuer)) => Some(SsoConfig {
+        (Some(client_id), Some(issuer)) => Some(DesktopSso {
             client_id: client_id.clone(),
             issuer: issuer.clone(),
             scopes: params.oidc_scopes.clone(),
             redirect_port: params.oidc_redirect_port,
         }),
+        (None, None) if params.reuse_saved_sso => settings.claude.desktop_sso.clone(),
         (None, None) => None,
         _ => bail!("SSO requires both --oidc-client-id and --oidc-issuer"),
     };
+    settings.claude.desktop_sso = sso.clone();
 
     if sso.is_none() && settings.gateway.api_key.as_deref().unwrap_or("").is_empty() {
         bail!(
@@ -97,18 +104,14 @@ pub fn onboard_desktop(params: OnboardDesktopParams) -> Result<()> {
     Ok(())
 }
 
-struct SsoConfig {
-    client_id: String,
-    issuer: String,
-    scopes: Option<String>,
-    redirect_port: Option<u16>,
-}
-
 /// Builds the top-level object Claude Desktop reads from its managed
 /// configuration. Keys match the Anthropic third-party configuration reference
 /// exactly; the same document is rendered as a plist on macOS and as JSON on
 /// Linux.
-fn build_managed_settings(settings: &RelaySettings, sso: Option<&SsoConfig>) -> Map<String, Value> {
+fn build_managed_settings(
+    settings: &RelaySettings,
+    sso: Option<&DesktopSso>,
+) -> Map<String, Value> {
     let mut root = Map::new();
     root.insert("inferenceProvider".into(), Value::String("gateway".into()));
     root.insert(
@@ -187,14 +190,18 @@ impl ManagedLayout {
     }
 
     fn resolve(path_override: Option<PathBuf>) -> Self {
-        let format = ManagedFormat::for_host();
         if let Some(path) = path_override {
+            let format = match path.extension().and_then(|ext| ext.to_str()) {
+                Some(ext) if ext.eq_ignore_ascii_case("plist") => ManagedFormat::MacOsPlist,
+                _ => ManagedFormat::LinuxJson,
+            };
             return Self {
                 path,
                 format,
                 stale_path: None,
             };
         }
+        let format = ManagedFormat::for_host();
         match format {
             ManagedFormat::MacOsPlist => Self {
                 path: PathBuf::from(MACOS_MANAGED_PLIST),
@@ -234,7 +241,10 @@ fn write_managed_settings(
     }
 
     if verify_managed_settings(layout, document).is_err() {
-        fs::create_dir_all(layout.managed_dir())
+        let managed_dir = layout.managed_dir();
+        let dir_missing = !managed_dir.exists();
+        fs::create_dir_all(managed_dir).map_err(|error| managed_write_error(error, layout))?;
+        pin_managed_dir_mode(managed_dir, dir_missing)
             .map_err(|error| managed_write_error(error, layout))?;
         let rendered = render_managed_settings(layout.format, document)?;
         replace_atomically(&layout.path, &rendered)
@@ -299,6 +309,23 @@ fn mark_world_readable(staged: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn mark_world_readable(_staged: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// A managed directory Relay creates is pinned to 0755 so the tool's managed
+/// configuration stays readable to every local account regardless of umask.
+/// Directories that already existed keep whatever mode the admin set.
+#[cfg(unix)]
+fn pin_managed_dir_mode(dir: &Path, created: bool) -> io::Result<()> {
+    if created {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn pin_managed_dir_mode(_dir: &Path, _created: bool) -> io::Result<()> {
     Ok(())
 }
 
@@ -398,8 +425,8 @@ mod tests {
         settings
     }
 
-    fn sso_config() -> SsoConfig {
-        SsoConfig {
+    fn sso_config() -> DesktopSso {
+        DesktopSso {
             client_id: "client-123".into(),
             issuer: "https://login.corp/v2.0".into(),
             scopes: None,
@@ -510,11 +537,20 @@ mod tests {
         let layout = ManagedLayout::resolve(Some(PathBuf::from("/tmp/relay/managed.plist")));
 
         assert_eq!(layout.path, PathBuf::from("/tmp/relay/managed.plist"));
-        assert_eq!(layout.format, ManagedFormat::for_host());
+        assert_eq!(layout.format, ManagedFormat::MacOsPlist);
         assert_eq!(
             layout.stale_path, None,
             "a custom layout must never delete the real /etc file"
         );
+    }
+
+    #[test]
+    fn should_pick_the_override_format_from_the_path_extension() {
+        let json = ManagedLayout::resolve(Some(PathBuf::from("/tmp/relay/managed.json")));
+        assert_eq!(json.format, ManagedFormat::LinuxJson);
+
+        let plist = ManagedLayout::resolve(Some(PathBuf::from("/tmp/relay/managed.PLIST")));
+        assert_eq!(plist.format, ManagedFormat::MacOsPlist);
     }
 
     #[test]
@@ -897,5 +933,135 @@ mod tests {
             error,
             "needs sudo (managed dir /Library/Managed Preferences is root-owned)"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_pin_a_managed_dir_it_created_to_0755() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("dirmode");
+        let layout = layout_in(
+            &dir,
+            "com.anthropic.claudefordesktop.plist",
+            ManagedFormat::MacOsPlist,
+            None,
+        );
+        let settings = settings_with("https://gw.corp", Some("sk-test"), "claude-sonnet-5");
+        let doc = build_managed_settings(&settings, None);
+
+        write_managed_settings(&layout, &doc).unwrap();
+
+        assert_eq!(
+            fs::metadata(layout.managed_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "a managed dir Relay creates must stay readable to every local account"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => env::set_var(name, value),
+            None => env::remove_var(name),
+        }
+    }
+
+    #[test]
+    fn should_reuse_the_saved_sso_on_an_unattended_rerun() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = scratch_dir("sso-reuse-home");
+        let managed = scratch_dir("sso-reuse").join("managed.plist");
+        let old_home = env::var_os("HOME");
+        let old_override = env::var_os(MANAGED_SETTINGS_PATH_ENV);
+        env::set_var("HOME", &home);
+        env::set_var(MANAGED_SETTINGS_PATH_ENV, &managed);
+
+        onboard_desktop(OnboardDesktopParams {
+            gateway_url: Some("https://gw.corp".into()),
+            api_key: Some("sk-saved".into()),
+            oidc_client_id: Some("client-1".into()),
+            oidc_issuer: Some("https://issuer.corp".into()),
+            quiet: true,
+            ..OnboardDesktopParams::default()
+        })
+        .unwrap();
+        onboard_desktop(OnboardDesktopParams {
+            reuse_saved_sso: true,
+            quiet: true,
+            ..OnboardDesktopParams::default()
+        })
+        .unwrap();
+
+        let on_disk: plist::Value = plist::from_file(&managed).unwrap();
+        assert_eq!(
+            on_disk.as_dictionary().unwrap()["inferenceCredentialKind"],
+            plist::Value::String("interactive".into()),
+            "the daemon rerun must rebuild the SSO document, not fall back to the saved key"
+        );
+        let saved = load_settings().unwrap();
+        assert_eq!(
+            saved
+                .claude
+                .desktop_sso
+                .as_ref()
+                .map(|sso| sso.client_id.as_str()),
+            Some("client-1")
+        );
+
+        restore_env("HOME", old_home);
+        restore_env(MANAGED_SETTINGS_PATH_ENV, old_override);
+        fs::remove_dir_all(&home).unwrap();
+        fs::remove_dir_all(managed.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn should_switch_back_to_a_static_key_and_clear_the_saved_sso() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = scratch_dir("sso-clear-home");
+        let managed = scratch_dir("sso-clear").join("managed.plist");
+        let old_home = env::var_os("HOME");
+        let old_override = env::var_os(MANAGED_SETTINGS_PATH_ENV);
+        env::set_var("HOME", &home);
+        env::set_var(MANAGED_SETTINGS_PATH_ENV, &managed);
+
+        onboard_desktop(OnboardDesktopParams {
+            gateway_url: Some("https://gw.corp".into()),
+            api_key: Some("sk-saved".into()),
+            oidc_client_id: Some("client-1".into()),
+            oidc_issuer: Some("https://issuer.corp".into()),
+            quiet: true,
+            ..OnboardDesktopParams::default()
+        })
+        .unwrap();
+        onboard_desktop(OnboardDesktopParams {
+            api_key: Some("sk-saved".into()),
+            reuse_saved_sso: false,
+            quiet: true,
+            ..OnboardDesktopParams::default()
+        })
+        .unwrap();
+
+        let on_disk: plist::Value = plist::from_file(&managed).unwrap();
+        assert_eq!(
+            on_disk.as_dictionary().unwrap()["inferenceCredentialKind"],
+            plist::Value::String("static".into())
+        );
+        let saved = load_settings().unwrap();
+        assert!(
+            saved.claude.desktop_sso.is_none(),
+            "a standalone static onboard must clear the saved SSO"
+        );
+
+        restore_env("HOME", old_home);
+        restore_env(MANAGED_SETTINGS_PATH_ENV, old_override);
+        fs::remove_dir_all(&home).unwrap();
+        fs::remove_dir_all(managed.parent().unwrap()).unwrap();
     }
 }
