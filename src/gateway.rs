@@ -75,23 +75,37 @@ impl CredentialCache {
                 self.refresh_in_background(gateway_url, api_key);
                 stale
             }
-            None => self.refresh(gateway_url, api_key).await,
+            None => {
+                let fresh = self.probe(gateway_url, api_key).await;
+                self.lock_state().entry = Some(fresh.clone());
+                fresh
+            }
         }
     }
 
-    async fn refresh(&self, gateway_url: &str, api_key: &str) -> CachedCredentialCheck {
+    async fn probe(&self, gateway_url: &str, api_key: &str) -> CachedCredentialCheck {
         let check = check_credential(&self.http, gateway_url, api_key).await;
-        let fresh = CachedCredentialCheck {
+        CachedCredentialCheck {
             cached_at: Instant::now(),
             checked_at: Utc::now(),
             gateway_url: gateway_url.to_string(),
             api_key: api_key.to_string(),
             check,
-        };
+        }
+    }
+
+    /// A background probe that lands after a re-enroll must not evict the new
+    /// credential's entry: only store when the entry still speaks for the pair
+    /// this probe checked.
+    fn store_background(&self, fresh: CachedCredentialCheck) {
         let mut state = self.lock_state();
-        state.entry = Some(fresh.clone());
+        let same_pair = state.entry.as_ref().is_none_or(|entry| {
+            entry.gateway_url == fresh.gateway_url && entry.api_key == fresh.api_key
+        });
+        if same_pair {
+            state.entry = Some(fresh);
+        }
         state.refreshing = false;
-        fresh
     }
 
     fn refresh_in_background(self: &Arc<Self>, gateway_url: &str, api_key: &str) {
@@ -106,7 +120,8 @@ impl CredentialCache {
         let gateway_url = gateway_url.to_string();
         let api_key = api_key.to_string();
         tokio::spawn(async move {
-            cache.refresh(&gateway_url, &api_key).await;
+            let fresh = cache.probe(&gateway_url, &api_key).await;
+            cache.store_background(fresh);
         });
     }
 
@@ -628,6 +643,47 @@ mod tests {
             "a re-enrolled key must be probed immediately, not serve the cached rejection"
         );
         assert_eq!(checked.api_key, "sk-new");
+    }
+
+    #[tokio::test]
+    async fn should_not_let_a_late_background_probe_evict_the_re_enrolled_entry() {
+        use crate::credential::test_support::serve_once;
+        use std::time::Duration;
+
+        let gateway = serve_once("200 OK", r#"{"data":[]}"#).await;
+        let cache = Arc::new(CredentialCache::new(Duration::from_secs(3600)));
+        assert_eq!(
+            cache.checked(&gateway, "sk-new").await.check,
+            CredentialCheck::Valid
+        );
+
+        let stale_probe = CachedCredentialCheck {
+            cached_at: Instant::now(),
+            checked_at: Utc::now(),
+            gateway_url: gateway.clone(),
+            api_key: "sk-old".to_string(),
+            check: CredentialCheck::Rejected {
+                detail: "expired".to_string(),
+            },
+        };
+        cache.store_background(stale_probe);
+        let entry = cache.lock_state().entry.clone().unwrap();
+        assert_eq!(entry.api_key, "sk-new");
+        assert_eq!(entry.check, CredentialCheck::Valid);
+
+        let fresh_probe = CachedCredentialCheck {
+            cached_at: Instant::now(),
+            checked_at: Utc::now(),
+            gateway_url: gateway.clone(),
+            api_key: "sk-new".to_string(),
+            check: CredentialCheck::Rejected {
+                detail: "expired".to_string(),
+            },
+        };
+        cache.store_background(fresh_probe);
+        let entry = cache.lock_state().entry.clone().unwrap();
+        assert_eq!(entry.api_key, "sk-new");
+        assert!(matches!(entry.check, CredentialCheck::Rejected { .. }));
     }
 
     #[tokio::test]
